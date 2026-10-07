@@ -1,6 +1,8 @@
-# Blackwall — Project Plan
+# Blackwall — Project Plan (v2: all-Rust)
 
 > A cyberpunk system visualizer. User space is **Deep Space**: a dark void where processes drift as living entities. The **Blackwall** is the kernel/user boundary: a vast luminous barrier, with the kernel's machinery humming behind it. You can drift through it as ambient art, then drill into any entity for real, actionable diagnostics.
+>
+> **v2 change:** The whole application is native Rust. Bevy renders the scene and egui provides the data panels. Tauri and the web frontend are gone. Cross-platform compatibility is now a first-class design constraint (§3).
 
 ---
 
@@ -9,289 +11,388 @@
 | Topic | Decision |
 |---|---|
 | Purpose | **Balanced**: an immersive view that is also a real diagnostics tool you can drill into |
-| Platforms | Linux, Windows, macOS. Fleet / remote servers come **later**, but the protocol is designed for them from day one |
-| Visual form | **Hybrid**: a 3D scene plus a flat, readable HUD overlay |
-| Stack | **Rust** backend, web frontend, packaged as a **Tauri** desktop app |
-| Metaphor | **Wall = kernel/user boundary**. Kernel and drivers sit behind the Wall. User-space processes float in Deep Space in front of it. Syscalls, IO and interrupts are streams crossing it |
+| Platforms | **Linux, Windows, macOS from day one** (x86_64 and ARM64). Fleet / remote servers come later; the protocol is designed for them now |
+| Visual form | **Hybrid**: a 3D scene plus a flat, readable on-screen overlay (HUD) |
+| Stack | **Rust for everything**: collector, renderer, UI, storage, privileged helper, future agent |
+| Metaphor | **Wall = kernel/user boundary**. Syscalls, IO and interrupts are streams crossing it |
 | Data layers (v1) | Processes and tree, storage, network, issues/health. All four are required |
-| Control | **Full control** (kill/suspend/renice, services, firewall), so it needs a real privilege and security design |
-| Detection | **Rules plus learned per-machine baselines** (anomaly / novelty detection) |
-| History | **Timeline plus replay**: scrub back in time and replay incidents |
-| Immersion | Sound design and a screensaver mode. **Full keyboard and touch support**, but as plain, accessible UX rather than a netrunner theme |
-| Performance | **Adaptive quality tiers**: detect the GPU, scale effects automatically, with a manual override |
+| Control | **Full control** (kill/suspend/renice, services, firewall) with a privilege-separated design |
+| Detection | **Rules plus learned per-machine baselines** |
+| History | **Timeline plus replay** |
+| Immersion | Sound design, screensaver mode, **full keyboard and touch support** (plain, accessible UX rather than a netrunner theme) |
+| Performance | **Adaptive quality tiers** |
 | Team / pace | Solo side project, so the plan is a series of small, shippable milestones |
 
 ---
 
-## 2. Choosing the 3D stack
+## 2. Technology choices
 
-The constraint that settles this is **Tauri's webviews**. Tauri renders with the OS webview: WebView2 (Chromium) on Windows, WKWebView (Safari) on macOS, and **WebKitGTK on Linux**. Windows and recent macOS can do WebGPU. WebKitGTK on Linux cannot be relied on for WebGPU, and its WebGL performance has historically trailed the other two. So whatever we choose must:
+### 2.1 Why all-Rust
+- **Native graphics everywhere.** Bevy renders through `wgpu`, which drives Vulkan, DirectX 12, Metal, or OpenGL as a fallback. There is no browser engine underneath, so the v1 plan's biggest risk (WebKitGTK on Linux) is gone.
+- **No bridge.** The collector writes straight into Bevy's entity system (ECS). There is no IPC channel, no serializing, and no Rust↔TypeScript type syncing.
+- **ECS fits the data.** Thousands of entities whose values change every second is exactly what an entity system is built for.
+- **One toolchain** across app, helper, agent, tests and CI.
 
-1. run on **WebGL2 as a first-class path**, and use WebGPU where it exists
-2. handle about 1,000–5,000 live entities through instancing
-3. leave room for a rich, accessible, text-heavy HUD
+### 2.2 The stack
+| Concern | Choice | Notes |
+|---|---|---|
+| Engine / renderer | **Bevy** (pinned to the current stable minor, 0.19.x at the time of writing) | Built-in bloom, chromatic aberration, tonemapping, automatic instancing/batching, picking, custom WGSL shaders, compute |
+| Data panels (HUD) | **`bevy_egui`** | Inspector, tables, alert feed, timeline, search, settings. Dense, fast to build, styleable |
+| Cinematic overlays | **Bevy UI** (headless widgets / Feathers) | Selection labels, lower-thirds, boot sequence, screensaver captions |
+| Audio | **`bevy_kira_audio`** + **`fundsp`** for the synthesized drone | Both run on `cpal`: WASAPI, CoreAudio, ALSA (PipeWire/Pulse through their ALSA layers) |
+| Async / threads | `tokio` for collectors and IO; `crossbeam-channel` into ECS | The render loop never blocks on collection |
+| System data | `sysinfo` (baseline) + per-OS crates (§5) | |
+| Storage | `rusqlite` with the **`bundled`** feature | The same SQLite version on every OS, with no system library dependency |
+| Networking (fleet later) | `quinn` (QUIC) + **`rustls`** | Pure Rust TLS: **no OpenSSL**, which avoids cross-platform build pain |
+| Serialization | `serde` + `postcard` (wire format), TOML (config/rules) | |
+| Paths | `directories` crate | Correct config/data/cache locations per OS |
 
-| Option | Verdict |
+**Bevy upgrade policy:** Bevy ships a breaking release every 3–4 months. Pin an exact minor version and keep `bevy_egui` and other plugins version-locked. Upgrade deliberately, at most twice a year, as its own small milestone. Keep engine-specific code inside the `bw-scene`/`bw-ui` crates so upgrades don't ripple into the collector or storage.
+
+### 2.3 Alternatives considered
+| Option | Why not |
 |---|---|
-| **Three.js (`WebGPURenderer` + TSL) + Svelte 5 HUD** | ✅ **Chosen.** One renderer that uses WebGPU when available and **falls back to WebGL2 automatically** (default since r171). TSL shaders compile to both WGSL and GLSL, so the glitch, bloom and hologram shaders are written once. It has by far the largest ecosystem. The scene is managed directly in code (not through React), which suits high-frequency data. Svelte 5's fine-grained reactivity keeps the HUD cheap when hundreds of values update every second |
-| Three.js + React Three Fiber | Strong runner-up with a great ecosystem. But React reconciliation for a scene whose data changes every tick is overhead, and we would end up bypassing it with direct refs anyway. Choose it only if you already know React well |
-| Babylon.js | A capable, batteries-included engine with a GUI and inspector. Its HUD toolkit is canvas-based and weaker for text and accessibility than DOM, and its ecosystem is much smaller |
-| PlayCanvas | Editor-centric and cloud-oriented, a poor fit for a code-driven data visualization |
-| Bevy (native Rust, no webview) | Tempting: one language, native GPU, no webview risk. But its UI story (text, forms, accessibility, touch, IME) is far behind the DOM, and we would lose Tauri and the shared web frontend for a future fleet UI. **Fallback plan only**, if Milestone 0 proves WebKitGTK can't hit the frame budget |
-
-**Frontend:** Vite + TypeScript + Svelte 5 for the HUD, with Three.js `WebGPURenderer` and TSL for the scene, post-processing through Three's node-based pipeline (bloom, chromatic aberration, scanlines, glitch), and the Web Audio API for sound.
-
-**Backend:** Rust workspace with Tauri v2 and Tokio, using Tauri `ipc::Channel` for streaming.
+| Tauri + Three.js (v1 plan) | Inconsistent GPU performance across OS webviews (especially WebKitGTK); two languages and an IPC bridge |
+| Raw `wgpu` + `egui` | Maximum control, but we would rebuild the camera, scene graph, bloom, picking and asset handling that Bevy already provides |
+| Fyrox | Capable engine, much smaller community |
+| Makepad / Slint / Iced | Good Rust UI toolkits, weak for a 3D-first scene |
 
 ---
 
-## 3. Architecture
+## 3. Cross-platform strategy
+
+Cross-platform compatibility is built in from the start, not ported later.
+
+### 3.1 Support matrix
+| OS | Architectures | Minimum version (proposed) | GPU backend (primary → fallback) | Windowing |
+|---|---|---|---|---|
+| **Windows** | x86_64, ARM64 | Windows 10 21H2 / Windows 11 | DX12 → Vulkan → WARP (software) | winit (Win32) |
+| **macOS** | Apple Silicon, Intel (universal2 binary) | macOS 12 Monterey | Metal | winit (AppKit) |
+| **Linux** | x86_64, ARM64 | glibc ≥ 2.31 (Ubuntu 20.04 / Debian 11 era) | Vulkan → OpenGL 3.3 / GLES 3 → llvmpipe/lavapipe (software) | winit: **Wayland and X11** |
+
+32-bit and big-endian platforms are out of scope.
+
+### 3.2 Principles
+1. **Every milestone ships on all three OSes.** Linux may get deeper probes first, but a milestone is not done until it builds, runs and is usable on Windows and macOS too, at least at the `sysinfo` baseline level.
+2. **Capabilities, not assumptions.** Each platform backend reports a `Capabilities` struct (for example `kernel_threads`, `per_proc_net_bytes`, `smart`, `temps`, `service_control`, `per_app_firewall`). The UI shows *"not available on this platform"* or *"needs elevated access"* instead of hiding things or showing fake data. A **capability matrix** is generated from the code and published in the docs.
+3. **One platform-abstraction crate.** OS-specific code lives only in `bw-platform/{linux,windows,macos}` behind traits, selected with `#[cfg(target_os)]`. Nothing else in the workspace uses `cfg(target_os)`; CI enforces this with a grep check.
+4. **Pure-Rust dependencies by preference.** Use `rustls` instead of OpenSSL, bundled SQLite, and bundled fonts. Every system library we do need is listed per OS in `docs/BUILDING.md`.
+5. **Read-only by default, elevated by choice.** Some data is hidden from unprivileged users on every OS (§5.2). The app works unprivileged; elevated *read* access comes through the same helper as actions (§7), opt-in.
+6. **Normalize OS quirks at the edge.** Platform backends produce the same normalized model, and the scene, detection and storage never see OS differences.
+
+### 3.3 Graphics compatibility
+- **Backend selection:** wgpu's default order, with a `--backend` override and environment variable (`WGPU_BACKEND`).
+- **The Low tier must run on the OpenGL/GLES backend.** No compute shaders, storage buffers or other features GL lacks are allowed in the Low tier.
+- **Software renderers** (WARP, llvmpipe, lavapipe) are detected from the adapter info. When one is found: force the Low tier, cap at 30 fps, and show a one-time notice. This covers VMs, Remote Desktop and headless CI.
+- **HiDPI:** honor winit's scale factor, including **fractional scaling on Wayland** and per-monitor DPI on Windows. Test at 100 %, 150 % and 200 %.
+- **Shaders** are written in WGSL and must compile on every backend. CI compiles all shader permutations through `naga` for SPIR-V, MSL, HLSL and GLSL.
+
+### 3.4 Input differences
+| Input | Windows | macOS | Linux |
+|---|---|---|---|
+| Touchscreen | Yes (winit touch events) | No touchscreens | Yes (Wayland and X11 touch) |
+| Trackpad gestures | Precision touchpad shows up as scroll | **Pinch and rotate gestures** (Bevy `PinchGesture`/`RotationGesture`) | Shows up as scroll (gesture support varies by compositor) |
+| Primary modifier | Ctrl | **Cmd** | Ctrl |
+
+- **Bindings:** use *logical* keys for character shortcuts (`/`, `?`) and *physical* keys for movement (WASD), so AZERTY and Dvorak work. Map the primary modifier per OS (Cmd on macOS, Ctrl elsewhere).
+- **Gestures** (orbit, pan, pinch, long-press) live in one `bw-input` gesture recognizer that consumes raw touch points, so behavior is identical wherever touch exists.
+
+### 3.5 Accessibility
+- Bevy and egui both integrate **AccessKit**, which maps to UI Automation on Windows, NSAccessibility on macOS and AT-SPI on Linux. Milestone 0 confirms this works end to end with `bevy_egui` on all three.
+- Reduced motion follows the OS setting where it can be read, with an in-app override.
+
+### 3.6 Text and fonts
+- **Fonts are bundled** (a monospace and a display face, plus Noto fallbacks for CJK and symbols), so rendering is identical on every OS.
+- Process names and paths are not always valid UTF-8 (Linux bytes, Windows UTF-16 with unpaired surrogates). Store them raw and display them lossily. Search matches on the lossy form.
+
+### 3.7 Packaging and distribution
+| OS | Formats | Signing / notes |
+|---|---|---|
+| Windows | MSI (`cargo-wix`) and a portable zip; winget later | **Code-sign** (Authenticode, e.g. Azure Trusted Signing). An unsigned binary that inspects and kills processes is likely to be flagged by antivirus |
+| macOS | `.app` in a DMG, universal2 | **Developer ID signing and notarization** (requires a paid Apple Developer account). The privileged helper (SMAppService) *requires* a signed app |
+| Linux | AppImage, `.deb` (`cargo-deb`), `.rpm` (`cargo-generate-rpm`), AUR | **No Flatpak or Snap for v1**: their sandboxes hide host processes, which defeats a system monitor. Revisit later with a host-side helper |
+
+- **Build glibc compatibility:** build Linux release binaries in an old-glibc container (or with `cargo-zigbuild` targeting glibc 2.31).
+- **Updates:** at first, through package managers and GitHub Releases. A self-updater with signed manifests (e.g. minisign) comes later.
+
+### 3.8 Special environments
+- **Containers / WSL2:** detect them. Inside a container we only see its own process namespace; show a banner saying so. WSL2 sees the Linux VM, not the Windows host, so the banner points to the native Windows build.
+- **Virtual machines:** expect software rendering (see §3.3).
+- **Non-systemd Linux** (OpenRC, runit): service control is unavailable by capability, and issues fall back to kmsg and syslog.
+
+### 3.9 CI matrix (GitHub Actions)
+| Runner | Targets | Jobs |
+|---|---|---|
+| `ubuntu-latest` and `ubuntu-24.04-arm` | x86_64 / aarch64 `-unknown-linux-gnu` | fmt, clippy, tests, **headless render smoke test on lavapipe**, package |
+| `windows-latest` and `windows-11-arm` | x86_64 / aarch64 `-pc-windows-msvc` | clippy, tests, **render smoke test on WARP**, MSI |
+| `macos-latest` (arm64) | aarch64 + x86_64 → universal2 (`lipo`) | clippy, tests, render smoke test (Metal), DMG |
+
+- **Render smoke test:** boot the app with a recorded fixture, render N frames offscreen, take a screenshot, and compare against a golden image with a tolerance.
+- **Collector conformance suite:** the same test suite runs against every platform backend. It checks that our own PID is found, the parent chain reaches the root, at least one volume and one interface exist, and values are in sane ranges.
+- **Fixture tests:** recorded `/proc` trees, Windows and macOS snapshots, and event logs, so parsing logic is tested on every OS regardless of the host.
+- **Budget benchmark:** collector CPU use must stay under 1–2 % of one core on every OS.
+
+---
+
+## 4. Architecture
 
 ```
-┌──────────────────────── Tauri app (unprivileged) ─────────────────────────┐
-│  Frontend (webview)                                                        │
-│   ├─ Scene (Three.js)   ← world-state store ← delta decoder               │
-│   ├─ HUD (Svelte)       ← same store (inspector, alerts, timeline, search)│
-│   └─ Audio (WebAudio)   ← derived load / alert signals                    │
-│                    ▲ ipc::Channel (snapshot + deltas, MessagePack)        │
-│  Rust core ────────┴──────────────────────────────────────────────────────│
-│   ├─ Source trait: LiveSource | ReplaySource | (later) RemoteSource       │
-│   ├─ collector/   per-OS probes → normalized model                        │
-│   ├─ detect/      rules engine + baselines → Issues                       │
-│   ├─ store/       SQLite time-series + events (downsampled tiers)         │
-│   └─ actions/     client → privileged helper (signed IPC)                 │
-└────────────────────────────────────────────────────────────────────────────┘
-                         │ local socket / named pipe, authenticated
-┌────────────────────────▼───────────────────────────────────────────────────┐
-│  blackwall-ice (privileged helper)  — allowlisted ops, audit log, no UI    │
-│  Linux: systemd unit + polkit │ Windows: service │ macOS: SMAppService     │
-└────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────── blackwall (single process, unprivileged) ─────────────────────────────┐
+│                                                                                                     │
+│  tokio runtime (background)                         Bevy App (main thread + render thread)          │
+│  ┌──────────────────────────────┐   crossbeam      ┌──────────────────────────────────────────────┐ │
+│  │ Source: Live | Replay |      │ ──deltas──────▶  │ ingest system → ECS components                │ │
+│  │         (later) Remote       │                  │ layout · interpolation · LOD · effects       │ │
+│  │  └─ bw-platform (per-OS)     │                  │ bw-scene (3D)  bw-ui (egui + Bevy UI)        │ │
+│  │ bw-detect (rules+baselines)  │ ──issues──────▶  │ bw-input (keys, touch, gestures)             │ │
+│  │ bw-store  (SQLite writer)    │ ◀──queries────── │ bw-audio (drone + cues)                      │ │
+│  └──────────────────────────────┘                  └──────────────────────────────────────────────┘ │
+│                 │  bw-actions client (typed requests)                                               │
+└─────────────────┼───────────────────────────────────────────────────────────────────────────────────┘
+                  ▼ authenticated local IPC (Unix socket / named pipe / XPC)
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ blackwall-ice (privileged helper) — allowlisted actions + optional elevated READ probes + audit log │
+│ Linux: systemd unit + polkit │ Windows: service │ macOS: SMAppService daemon                         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.1 Key design principles
-- **One normalized model, many sources.** The UI never knows whether data comes from live probes, a replay of the store, or (later) a remote agent. Fleet support then means adding a `RemoteSource`, not rewriting the app.
-- **Snapshot + delta protocol.** On connect, send a full snapshot; then send deltas at about 1–4 Hz (configurable). Every entity has a stable ID (`host:pid:start_time`, because PIDs get reused). Types are defined once in Rust and exported to TypeScript (`ts-rs` or `specta`).
-- **Capabilities, not assumptions.** Each OS probe advertises what it can see (`kernel_threads`, `per_proc_net`, `smart`, `syscall_rate`, …). The UI degrades gracefully and shows *"not visible on this platform"* instead of fake data.
-- **The UI is never privileged.** All mutations go through the helper (§7).
+### 4.1 Key design points
+- **Sources:** the same `Source` trait serves live data, replay of the store, and (later) remote agents. The ECS ingest system can't tell them apart.
+- **Snapshot + delta model:** stable entity IDs of `host:pid:start_time`, because PIDs get reused. Deltas arrive at 1–4 Hz. Rendering runs at the display rate and **interpolates** values between samples, so motion stays smooth.
+- **Rendering is decoupled from collection.** A slow probe (SMART, socket scan) can never drop frames.
+- **Engine isolation:** only `bw-scene`, `bw-ui`, `bw-input` and `bw-audio` depend on Bevy. The model, platform, store, detection and actions crates are engine-free, which keeps Bevy upgrades cheap and makes the future headless agent trivial.
 
-### 3.2 Repository layout
+### 4.2 Workspace layout
 ```
 blackwall/
-├─ Cargo.toml                 # workspace
+├─ Cargo.toml                 # workspace, pinned Bevy version
 ├─ crates/
-│  ├─ bw-model/               # entity types, protocol, IDs, capabilities (no OS deps)
-│  ├─ bw-collect/             # Collector trait + linux/ windows/ macos/ modules
-│  ├─ bw-store/               # SQLite time-series, events, retention, replay cursor
-│  ├─ bw-detect/              # rules (TOML) + baselines + issue lifecycle
-│  ├─ bw-actions/             # action schema, client, audit types
-│  └─ bw-ice/                 # privileged helper binary
-├─ app/
-│  ├─ src-tauri/              # Tauri shell, wires Source → Channel
-│  └─ src/                    # Svelte + Three.js frontend
-│     ├─ scene/  (layout, instancing, shaders/TSL, camera, quality tiers)
-│     ├─ hud/    (panels, timeline, alerts, command palette, inspector)
-│     ├─ input/  (keyboard focus model, touch gestures)
-│     └─ audio/
+│  ├─ bw-model/               # entities, IDs, deltas, Capabilities (no OS / engine deps)
+│  ├─ bw-platform/            # Collector + Actions traits
+│  │  ├─ src/linux/  src/windows/  src/macos/
+│  │  └─ tests/conformance.rs # same suite on every OS
+│  ├─ bw-source/              # LiveSource, ReplaySource, (later) RemoteSource
+│  ├─ bw-store/               # SQLite time-series, events, retention
+│  ├─ bw-detect/              # rules (TOML), baselines, issue lifecycle
+│  ├─ bw-actions/             # action schema, IPC client, audit types
+│  ├─ bw-ice/                 # privileged helper binary
+│  ├─ bw-scene/               # Bevy: layout, materials, WGSL shaders, camera, quality tiers
+│  ├─ bw-ui/                  # bevy_egui panels + Bevy UI overlays, theme
+│  ├─ bw-input/               # focus model, keymaps, gesture recognizer
+│  ├─ bw-audio/               # synth drone, cues
+│  └─ blackwall/              # the app binary: wires everything together
+├─ assets/                    # bundled fonts, shaders, sounds (if any)
 ├─ rules/                     # default detection rules (TOML)
+├─ fixtures/                  # recorded snapshots per OS for tests
+├─ packaging/                 # wix/, macos/, linux/ (deb, rpm, AppImage)
 └─ docs/
 ```
 
 ---
 
-## 4. Data collection (per layer, per OS)
+## 5. Data collection
 
-The baseline everywhere is the [`sysinfo`](https://crates.io/crates/sysinfo) crate for processes, CPU, memory, disks and network interfaces. Platform modules add depth on top of it.
+### 5.1 Per layer, per OS
+`sysinfo` is the shared baseline. The platform modules add depth on top of it.
 
-| Layer | Linux (richest, built first) | Windows | macOS |
+| Layer | Linux | Windows | macOS |
 |---|---|---|---|
-| **Processes + tree** | `procfs` crate: ppid, state (incl. **zombie / D-state**), threads, cgroup, start time, cmdline | `sysinfo` + Toolhelp/NtQuery, job objects | `libproc` (`proc_pidinfo`), `sysctl` |
-| **Kernel side (behind the Wall)** | kthreads (children of `kthreadd`), `/proc/stat` (ctx switches, interrupts, softirqs), `/proc/pressure/*` (**PSI**), `/proc/vmstat`, loaded modules. Later: **eBPF via `aya`** for per-process syscall rates | PID 4 "System", DPC/ISR time, drivers list; later ETW (`ferrisetw`) | `kernel_task`, kexts, `host_statistics64` |
-| **Storage** | `/proc/diskstats` (IO and latency), mounts, fill, SMART via `smartctl --json` (optional), inode exhaustion | `GetDiskFreeSpaceEx`, perf counters, SMART via WMI | IOKit stats, `smartctl` |
-| **Network** | `netlink sock_diag` for sockets mapped to PIDs (`netstat2` crate), per-interface throughput | `GetExtendedTcpTable` (`netstat2`) | `libproc` fd/socket info (`netstat2`) |
-| **Issues / events** | journald (`systemd-journal`), kmsg (**OOM kills**, segfaults, IO errors), failed systemd units, hwmon temps | Event Log (crash/WER, service failures), WMI temps where exposed | Unified log (`log stream --predicate`), crash reports dir |
+| **Process tree** | `procfs`: ppid, state (zombie / D-state), threads, cgroup → container grouping | Toolhelp32 + `NtQueryInformationProcess`. **Parent PIDs are unreliable** (the parent may have exited and its PID been reused): validate that the parent's start time is earlier than the child's | `libproc`. Most apps have ppid = 1 (launchd): group helper processes by **responsible process** |
+| **Kernel side (behind the Wall)** | kthreads (children of `kthreadd`), `/proc/stat` (context switches, interrupts, softirqs), **PSI** (`/proc/pressure`), `/proc/vmstat`, modules. Later: **eBPF via `aya`** for per-process syscall rates (root) | System (PID 4), Registry, Memory Compression, Secure System; drivers via `EnumDeviceDrivers`; DPC/interrupt time and context switches via **PDH** counters; ETW later (admin) | `kernel_task`, kexts and system extensions, `host_statistics64` (VM pressure, faults), context switches via `host_processor_info` |
+| **Storage** | `/proc/diskstats`, mounts, inodes; SMART via `smartctl --json` if installed | Volumes API, PDH disk counters; health via `MSFT_StorageReliabilityCounter` (WMI) | IOKit block-storage statistics; SMART via `smartctl` if installed |
+| **Network** | sockets → PID via `netstat2` (sock_diag); per-interface rates | `netstat2` (`GetExtendedTcpTable`/`UdpTable`) | `netstat2` (libproc) |
+| **Per-process bandwidth** | eBPF (root) | ETW TCP/IP provider (admin) | `nettop`-style statistics (root, best effort) |
+| **Issues / events** | journald, kmsg (**OOM**, segfaults, IO errors), failed systemd units | Event Log (crashes/WER, service failures, disk errors) | Unified log (`log stream`), `DiagnosticReports` crash files |
+| **Temperatures** | hwmon (reliable) | Best effort (WMI thermal zones are often missing); **no kernel drivers** | Best effort via IOKit/SMC sensors |
 
-Collection cadence comes in tiers: **fast** (1 Hz: CPU/mem/IO/net rates), **medium** (5 s: sockets, process tree diff), **slow** (60 s: SMART, disk scans, service states). The collector must stay below about 1–2% of one CPU core. Measure this in Milestone 1 and keep it as a CI benchmark.
+**Collection cadence:** fast at 1 Hz (CPU, memory, IO and network rates), medium every 5 s (sockets, tree diff), slow every 60 s (SMART, services, temperatures).
+
+### 5.2 Visibility without elevation
+| OS | What an unprivileged user can't see |
+|---|---|
+| Linux | Other users' `/proc/<pid>/fd`, `io` and `environ` (depends on `hidepid`/ptrace scope); eBPF |
+| Windows | Details of SYSTEM and other users' processes (path, command line, memory) without SeDebugPrivilege; ETW |
+| macOS | Most `proc_pidinfo` details for other users' processes; anything blocked by SIP or TCC |
+
+If the user opts in, `blackwall-ice` runs these probes elevated and streams **read-only** results to the app over the same authenticated IPC. Without it, the scene still shows those processes, marked *"restricted"*.
 
 ---
 
-## 5. The visual language
+## 6. The visual language
 
-### 5.1 Spatial layout
-- **The Blackwall**: a vast, slightly curved plane in the far background. It is a translucent hexagonal lattice with slow, flowing red-violet energy. Its **brightness and turbulence track kernel pressure** (PSI, iowait, softirq load). Under heavy pressure it ripples, and under critical pressure it **cracks and glitches**.
-- **Behind the Wall (kernel space)**: dim, monolithic structures seen through the barrier, one per subsystem: *Scheduler*, *Memory Manager*, *VFS / Block layer*, *Network stack*, *Drivers / Modules*, *Interrupts*. Kernel threads are small sparks clustered around their subsystem.
-- **Deep Space (user space)**: processes, laid out as a **process tree in orbital form**. Init/launchd/services.exe is a central "star"; services and session leaders orbit it, and children orbit their parents. Layout is a stable, damped force simulation so things don't jump around. New processes **materialize** and exiting ones **dissolve**.
-- **Storage**: "data fortresses" anchored at the Wall's edge, one per physical disk, with volumes as rings around them. A ring's fill shows usage and its color shows health (SMART). IO appears as **particle streams from a process, through the Wall, to its disk**. Stream thickness is throughput, and stream color is latency.
-- **Network**: interfaces are "gates" at the edge of space. Connections are beams from a process out to remote endpoints, which appear as distant star clusters grouped by subnet or ASN. Listening ports are small open "ports" on the entity's surface.
-- **Crossing the Wall**: syscalls, IO, page faults and interrupts are shown as **data streams crossing the barrier**. This is the core of the metaphor. Linux gets the richest view (eBPF later); other OSes use the aggregate rates they expose.
+### 6.1 Spatial layout
+- **The Blackwall**: a vast, curved, translucent hexagonal-lattice barrier (a custom WGSL material). Its turbulence tracks kernel pressure (PSI on Linux; equivalent signals elsewhere). Under critical pressure it **cracks and glitches**.
+- **Behind the Wall:** dim monoliths for the *Scheduler*, *Memory Manager*, *Storage/VFS*, *Network stack*, *Drivers* and *Interrupts*. Kernel threads and drivers are sparks clustered around them. A monolith with no data on the current OS is drawn as a faded silhouette labeled "no telemetry".
+- **Deep Space:** the process tree in orbital form. Init/launchd/services is the central star; children orbit their parents. Layout uses a stable, damped force simulation that runs in an ECS system. New processes materialize and exiting ones dissolve.
+- **Storage:** "data fortresses" at the Wall's edge, one per disk, with volumes as rings around them. IO is drawn as particle streams from a process, through the Wall, to its disk.
+- **Network:** interfaces are gates at the edge of space, with beams out to distant clusters of remote endpoints.
+- **Crossing the Wall:** syscalls, IO, page faults and interrupts are drawn as streams through the barrier. This is the core of the metaphor.
 
-### 5.2 Encoding a process (redundant: never color alone)
+### 6.2 Encoding a process (redundant: never color alone)
 | Property | Visual channel |
 |---|---|
 | Memory (RSS) | Size |
 | CPU % | Brightness and pulse rate |
-| Owner (root/system / user / other user) | Shape (octahedron / sphere / icosahedron) and base hue |
-| State: zombie | Grey hollow husk that doesn't pulse |
-| State: uninterruptible IO (D) | Pulled toward the Wall, tethered to its disk |
-| Anomaly / issue | Red glitch shader, corruption particles, and a HUD marker with an icon |
-| Network active | Orbiting particles; beams when selected |
+| Owner (system / current user / other) | Shape (octahedron / sphere / icosahedron) and base hue |
+| Zombie | Grey hollow husk that doesn't pulse |
+| Uninterruptible IO | Pulled toward the Wall, tethered to its disk |
+| Restricted (no access) | Wireframe shell with a lock glyph |
+| Issue / anomaly | Glitch shader, corruption particles, and a HUD marker with an icon |
 
-### 5.3 HUD (Svelte, DOM-based, readable)
-- **Inspector** for the selected entity: real numbers, sparklines, open files and sockets, children, history, and an actions menu.
-- **Alert feed**: the active issues list, sorted by severity; clicking an alert flies the camera to it.
-- **Timeline** along the bottom edge: live/replay toggle, scrubber, and incident markers.
-- **Search / command palette** (`/` or `Ctrl+K`): find a process by name or PID, jump to a disk, run an action.
-- **Layer toggles**: processes / storage / network / kernel / issues-only.
-- **Legend** for all encodings, always one key away.
+**Scale:** sibling groups (e.g. 40 browser renderer processes) collapse into **swarms**, with semantic zoom to expand them. There are also "issues only" and "top N" filters.
 
----
-
-## 6. Detection: rules and baselines
-
-### 6.1 Rules (declarative, TOML, shipped defaults plus user overrides)
-```toml
-[[rule]]
-id = "disk.fill.critical"
-when = "volume.used_pct > 95"
-for = "2m"
-severity = "critical"
-message = "Volume {mount} is {used_pct}% full"
-```
-Defaults include: disk above 90% or 95% full, inode exhaustion, sustained CPU saturation, memory pressure (PSI), swap thrash, zombie accumulation, OOM kill events, failed services, SMART warnings, high IO latency, temperature thresholds, and processes stuck in D-state.
-
-### 6.2 Baselines (learned on each machine)
-- **Identity** = executable path + hash, not PID.
-- Per identity: an **hour-of-week profile** of CPU, memory, IO and network, computed as streaming quantiles (t-digest or EWMA buckets). Flag readings above p99 of baseline for N minutes.
-- **Novelty detection**, which is cheap and high-signal:
-  - a known binary contacting a **never-before-seen** remote network or opening a **new listening port**
-  - a new child executable spawned by a long-lived service
-  - a brand-new binary running as root or SYSTEM
-  - a new kernel module or driver loaded
-- **Learning period**: anomalies are suppressed for the first 7 days on a machine (configurable), with a visible "learning" state in the HUD.
-- Every issue has a lifecycle (*open → acknowledged → resolved / snoozed*) and an **explanation** ("CPU 4.2× its usual Tuesday-14:00 level").
+### 6.3 HUD
+- **egui:** inspector (numbers, sparklines, open files and sockets, children, history, actions), alert feed, timeline scrubber, search / command palette, settings, legend, and a **list view of everything in the scene** for accessibility.
+- **Bevy UI:** world-anchored labels, selection reticle, lower-third captions, boot / "jack-in" intro.
+- **One cyberpunk theme** applied to both (`egui::Visuals` plus Bevy UI styles), with a high-contrast variant.
 
 ---
 
-## 7. Actions and security (full control, done safely)
+## 7. Actions and security
 
-Full control means Blackwall can damage the system. The design:
-
-1. **Privilege separation.** The Tauri app is never elevated. `blackwall-ice` is a small privileged helper whose entire job is to run a **fixed allowlist of typed operations**: no shell, and no arbitrary commands.
-2. **Authenticated local IPC.** Linux uses a Unix socket with `SO_PEERCRED` and a polkit authorization check per action class. Windows uses a named pipe with an ACL and client-process verification. macOS uses an XPC/SMAppService helper with code-signature checks on the client.
-3. **Action tiers**:
-   - *Tier 1 (process)*: kill (TERM, then KILL), suspend/resume, renice/priority, open file location. **v1 ships with these.**
-   - *Tier 2 (services)*: start/stop/restart a systemd unit, Windows service or launchd job.
-   - *Tier 3 (network)*: block a remote endpoint or a process's network access through a firewall rule (nftables / Windows Filtering Platform / pf). Every rule is tagged as Blackwall's and **auto-expires** unless pinned.
-4. **Guardrails**: confirmation for every action (with typed confirmation for PID 1, kernel threads, the user's own session and Blackwall itself); a dry-run preview showing exactly what will happen; protected-process lists; rate limits.
-5. **Audit log**: an append-only, hash-chained record of every action (who, what, when, result) in the store, which also shows on the timeline.
-6. **Future fleet**: the same action schema over **mTLS**, with per-host authorization. Remote actions stay off by default.
-
----
-
-## 8. History, timeline and replay
-
-- **Store**: SQLite in WAL mode (`rusqlite`), one file per host.
-  - `samples`: metric time series with **tiered downsampling**: 1 s resolution for 2 h, 10 s for 48 h, 1 min for 30 days, 15 min for 1 year. All of this is configurable, with a hard disk-size cap.
-  - `entities`: lifetimes of processes, sockets and volumes (born/died).
-  - `events`: issues, kernel events, actions. These are kept longer than metrics.
-- **Replay** is a `ReplaySource` that rebuilds snapshots and deltas from the store, so the frontend renders history with **exactly the same code path** as live data. Scrub, play at 1×/10×/60×, and jump to the previous or next incident.
-- Baselines (§6.2) are trained from this same store.
-- Optional later: export to Prometheus/OpenMetrics.
+1. **Privilege separation.** The app is never elevated. `blackwall-ice` runs a **fixed allowlist of typed operations**: no shell, and no arbitrary commands.
+2. **Per-OS helper installation and authentication**:
+   | OS | Helper | Who may connect |
+   |---|---|---|
+   | Linux | systemd system service, Unix socket | `SO_PEERCRED` plus a **polkit** check per action class. On non-systemd distros, a setuid-free fallback via `pkexec` per action |
+   | Windows | Windows service, named pipe | Pipe ACL; verify the client process's image path and Authenticode signature |
+   | macOS | **SMAppService** launch daemon, XPC | Code-signing requirement check on the connecting client |
+3. **Action tiers and platform support**:
+   | Tier | Action | Linux | Windows | macOS |
+   |---|---|---|---|---|
+   | 1 | Kill (graceful → force) | SIGTERM → SIGKILL | `WM_CLOSE`/`TerminateProcess` | SIGTERM → SIGKILL |
+   | 1 | Suspend / resume | SIGSTOP / SIGCONT | `NtSuspendProcess` / `NtResumeProcess` | SIGSTOP / SIGCONT |
+   | 1 | Priority | `setpriority` / ionice | `SetPriorityClass` | `setpriority` |
+   | 1 | Reveal executable | xdg-open (directory) | Explorer `/select` | Finder reveal |
+   | 2 | Service start/stop/restart | systemd via D-Bus (`zbus`) | Service Control Manager | `launchctl` (bootstrap/kickstart) |
+   | 3 | Block a remote endpoint | **nftables**, in Blackwall's own table (coexists with ufw and firewalld) | **Windows Filtering Platform** / Firewall COM API | **pf anchor** |
+   | 3 | Block a *process's* network | cgroup + nftables | WFP app-ID filter | ❌ needs a Network Extension (Apple entitlement): capability off |
+4. **Guardrails:** confirm every action, with typed confirmation for critical targets (PID 1, kernel threads, the session leader, Blackwall itself); a dry-run preview; protected-process lists per OS; rate limits. Firewall rules created by Blackwall **auto-expire** unless pinned.
+5. **Audit log:** append-only and hash-chained, written by the helper (so the app can't forge it), mirrored into the store, and shown on the timeline.
+6. **Future fleet:** the same action schema over QUIC with mTLS and per-host authorization. Remote actions are off by default.
 
 ---
 
-## 9. Input: keyboard and touch (equal citizens)
+## 8. Detection: rules and baselines
+
+- **Rules** (TOML, shipped defaults plus user overrides), for example `volume.used_pct > 95 for 2m → critical`. Defaults cover disk fill, inode exhaustion, sustained CPU saturation, memory pressure, swap thrash, zombies, OOM kills, failed services, SMART warnings, IO latency, temperatures and stuck processes.
+- **Rules use the normalized model, so one rule works on every OS.** A rule that depends on a capability (e.g. PSI) declares it and is silently inactive where that capability is missing; the rules panel lists inactive rules and why.
+- **Baselines:**
+  - **Identity** = executable path plus hash.
+  - Per identity: an **hour-of-week profile** of CPU, memory, IO and network using streaming quantiles. Flag readings above p99 sustained for N minutes.
+  - **Novelty detectors:** a new remote network, a new listening port, a new child executable, a new binary running as root or SYSTEM, a new kernel module or driver.
+  - **Learning period:** anomalies are suppressed for the first 7 days, with a visible "learning" state.
+- **Issue lifecycle:** open → acknowledged → resolved / snoozed, with a plain-language **explanation** and one-click "this is normal" feedback that updates the baseline.
+
+---
+
+## 9. History, timeline and replay
+
+- **Store:** SQLite in WAL mode (bundled), one database per host, in the OS-correct data directory (`directories` crate).
+- **Tiered downsampling:** 1 s for 2 h → 10 s for 48 h → 1 min for 30 days → 15 min for 1 year, with a hard size cap. Entity lifetimes and events are kept longer.
+- **`ReplaySource`** rebuilds snapshots and deltas from the store, so replay uses the **same rendering path** as live data. Scrub, play at 1×/10×/60×, and jump to the previous or next incident.
+- **Exportable incident captures** (`.bwcap`: a postcard-encoded slice of the store) can be replayed on any OS. This also gives the cross-platform fixture tests their recorded data.
+
+---
+
+## 10. Input: keyboard and touch
 
 **Keyboard** (every feature reachable without a mouse):
-- A logical focus model that is independent of 3D picking. `Tab` cycles HUD regions; arrow keys move through the **process tree** (parent / child / sibling) and the camera follows the focused entity.
-- `Enter` inspects, `A` opens actions, `/` searches, `Space` toggles live/replay, `[` `]` steps between incidents, `1–5` toggle layers, `?` shows the shortcut sheet.
-- WASD/QE free-fly camera mode, toggled explicitly so it never steals text input.
-- Visible focus rings in both the HUD and the scene (a holographic selection reticle).
+- A logical **focus model** that is independent of 3D picking. `Tab` cycles HUD regions; arrow keys walk the process tree (parent / child / sibling) and the camera follows the focus. This builds on Bevy's directional navigation.
+- `Enter` inspects, `A` opens actions, `/` or `Mod+K` opens search, `Space` toggles live/replay, `[` `]` step between incidents, `1–5` toggle layers, `?` shows the shortcut sheet. `Mod` is Cmd on macOS and Ctrl elsewhere.
+- WASD/QE free-fly mode, using physical keys so it is layout independent and toggled explicitly so it never steals text input.
+- Keymaps can be remapped in a TOML file.
 
-**Touch:**
-- One-finger orbit, two-finger pan, pinch to zoom, tap to select, long-press for actions, double-tap to focus.
-- Touch targets of at least 44 px. Picking uses enlarged invisible hit volumes, so small entities are still tappable.
-- The HUD adapts to tablet-sized windows: panels become bottom sheets.
+**Touch and gestures:**
+- One finger orbits, two fingers pan, pinch zooms, tap selects, long-press opens actions, double-tap focuses.
+- macOS trackpad pinch and rotate map to the same actions.
+- Enlarged invisible picking volumes, so small entities stay tappable. HUD targets are at least 44 px. On narrow or tall windows, panels become bottom sheets.
 
-**Accessibility:** reduced-motion mode (honors the OS setting: no glitch, no shake, slow camera), a high-contrast theme, color-blind-safe encodings (shape and pattern are always redundant with color), and a screen-reader-friendly **list view** of everything in the scene.
-
----
-
-## 10. Sound design
-
-- Synthesized with the Web Audio API, so no large audio assets are needed.
-- **Ambient drone**: layered detuned oscillators and filtered noise. Filter cutoff and detune follow overall load, and a sub-bass layer follows kernel pressure.
-- **Event cues**: soft chimes for process birth and death (rate-limited and aggregated), a distinct sting per severity, and a crack sound when the Wall glitches.
-- Optional spatial audio: the selected entity hums from its position.
-- **Off by default**, with a master volume, per-category mixing, and automatic mute when the window loses focus (configurable).
+**Accessibility:** reduced motion (OS setting plus override), high-contrast theme, color-blind-safe redundant encodings, an AccessKit-exposed list view, and adjustable UI scale independent of DPI.
 
 ---
 
-## 11. Screensaver mode
+## 11. Sound design
 
-- After N minutes idle (or on demand, or launched as an OS screensaver host later), go fullscreen and start an **autopilot camera**: smooth spline tours between "points of interest" (the hottest process, busiest disk, newest connection, active issues), with slow drifts along the Wall.
-- The HUD reduces to a minimal lower-third caption ("`firefox` — 2.1 GB — 14% CPU").
-- Any input exits instantly, back to where you were.
-- It respects quality tiers and drops to a low-power frame cap (e.g. 30 fps).
+- Real-time synthesis with `fundsp`: detuned oscillator layers and filtered noise. Filter cutoff and detune follow overall load; a sub-bass layer follows kernel pressure.
+- Event cues (birth/death chimes, rate-limited; one sting per severity; a "crack" when the Wall glitches) through `bevy_kira_audio`.
+- Optional spatial hum from the selected entity.
+- **Off by default**, with master and per-category volume and mute-on-unfocus.
+- **Cross-platform:** everything goes through `cpal`. If no output device is present (servers, CI, some VMs), audio silently disables itself and never crashes the app. Device hot-swap (headphones plugged in) is handled by re-opening the stream.
 
 ---
 
-## 12. Adaptive quality tiers
+## 12. Screensaver mode
 
-| Tier | Target | Effects |
+- **In-app idle mode, on all OSes:** after N minutes without input, go borderless fullscreen and run an **autopilot camera** that tours points of interest (hottest process, busiest disk, newest connection, active issues). The HUD reduces to lower-third captions. Any input exits instantly.
+- **System-wide idle detection** (optional): `GetLastInputInfo` on Windows; `CGEventSourceSecondsSinceLastEventType` on macOS; on Linux, `ext-idle-notify-v1` under Wayland or the XScreenSaver extension under X11.
+- **Prevent display sleep** while the tour is running, using each OS's inhibit API (`SetThreadExecutionState` / IOPMAssertion / the `org.freedesktop.ScreenSaver` inhibit call). This is user-toggleable.
+- **Native OS screensaver integration** comes later and is per-OS: a Windows `.scr` wrapper is easy (the same binary with `/s /p /c` arguments). A macOS `.saver` bundle and Linux xscreensaver hacks are much harder and out of scope for v1.
+- Runs at the Low or Medium tier with a 30 fps cap to save power.
+
+---
+
+## 13. Adaptive quality tiers
+
+| Tier | Typical target | Effects |
 |---|---|---|
-| Low | iGPU on WebKitGTK/WebGL2, battery | Instanced simple meshes, no post-FX, about 30 % particles, 30–60 fps |
-| Medium | iGPU / WebGL2 | Bloom (half-res), basic glitch shader, LOD |
-| High | dGPU or WebGPU | Full bloom, chromatic aberration, scanlines, volumetric Wall, more particles |
-| Ultra | Strong dGPU + WebGPU | GPU-compute particles (TSL compute), higher-res post, per-entity shaders |
+| **Low** | Software renderers, GL fallback, old iGPUs, battery | Instanced simple meshes, no post-processing, about 30 % particles, 30 fps cap. **Must work on GL/GLES** |
+| **Medium** | Modern iGPU (Intel Xe, AMD APU, Apple M-series on battery) | Bloom, basic glitch shader, LOD |
+| **High** | Discrete GPU or Apple M-series on power | Full bloom, chromatic aberration, scanlines, volumetric Wall, more particles |
+| **Ultra** | Strong discrete GPU (Vulkan / DX12 / Metal) | GPU-compute particles, higher-res post-processing, per-entity shader effects |
 
-- **Initial tier** is chosen from the backend (WebGPU or WebGL2), the GPU renderer string, and the device pixel ratio.
-- **Runtime governor**: if frame time stays above budget for 3 s, drop a tier; if it stays well under budget for 30 s, try a tier up. A manual override is available in settings.
-- **Always on**: instancing (one draw call per entity type), frustum culling, LOD/impostors for distant entities, and capped DPR on high-DPI screens.
+- **Initial tier** comes from the wgpu adapter: backend, device type (discrete / integrated / CPU), vendor, limits, and the power state where the OS reports it.
+- **Runtime governor:** drop a tier if frame time stays over budget for 3 s; try a tier up after 30 s well under budget. A manual override is in settings.
+- **Always on:** automatic instancing, frustum culling, LOD/impostors, render scale below 1.0 on high-DPI screens at lower tiers, and reduced work when the window is unfocused or minimized.
 
 ---
 
-## 13. Milestones (solo, side project — each one is usable on its own)
+## 14. Milestones (solo, side project — each one usable on its own, **on all three OSes**)
 
 Sizes: **S** ≈ a few evenings, **M** ≈ 2–3 weekends, **L** ≈ a month or more of side time.
 
 | # | Milestone | Size | Done when… |
 |---|---|---|---|
-| **0** | **Tech spike / go-no-go** | S | Tauri + Three `WebGPURenderer` renders 3,000 instanced glowing entities with bloom at ≥ 60 fps on Windows and macOS and ≥ 30 fps on a Linux iGPU under WebKitGTK. If Linux fails badly, re-evaluate (Bevy fallback, or a Linux-specific low tier) |
-| **1** | **Deep Space (processes)** | M | Linux collector via `sysinfo` + `procfs`; `bw-model` protocol (snapshot + delta → `ipc::Channel`); orbital process tree; inspector; keyboard focus model and search |
-| **2** | **The Blackwall** | M | Wall shader driven by PSI/iowait; kernel-subsystem structures; kthreads; aggregate syscall/IO/interrupt streams crossing the Wall |
-| **3** | **Storage + Network** | M | Disk fortresses and volume rings, IO streams; socket → process mapping, endpoint clusters, listening ports |
-| **4** | **Memory: history & replay** | M | SQLite store with downsampling; `ReplaySource`; timeline scrubber; the same renderer for live and replay |
-| **5** | **Issues: rules** | M | TOML rules engine, journald/kmsg/OOM/failed units, alert feed, glitch visuals, fly-to-issue |
-| **6** | **Windows + macOS collectors** | L | Capability flags; parity for processes, storage, network and event sources; CI builds for all three |
-| **7** | **Actions tier 1 + ICE helper** | L | Privileged helper on all three OSes, authenticated IPC, kill/suspend/renice, audit log, confirmations |
-| **8** | **Baselines & anomalies** | M | Hour-of-week profiles, novelty detectors, learning period, explanations |
-| **9** | **Immersion polish** | M | Sound design, screensaver/autopilot, quality governor, touch gestures, reduced-motion and list view |
-| **10** | **Actions tiers 2–3** | M | Service control, firewall blocks with auto-expiry |
-| **11** | **Fleet-ready** | L | Extract `bw-agent` (headless collector + store), `RemoteSource` over mTLS, a host switcher in the UI. A hub can come after this |
-| Later | eBPF syscall flows (`aya`), Prometheus export, web-served UI, signed releases + auto-update | — | — |
+| **0** | **Foundation spike + CI** | M | Workspace skeleton; CI matrix (§3.9) green on all 6 targets; Bevy renders 3,000 instanced glowing entities with bloom at 60 fps on real hardware for each OS, **and the Low tier runs on llvmpipe and WARP**; a `bevy_egui` panel with the cyberpunk theme; AccessKit confirmed; touch and pinch events confirmed. **Go/no-go on the egui look.** |
+| **1** | **Deep Space: processes** | M | `bw-platform` baseline on all three OSes (`sysinfo` + parent validation); snapshot/delta ingest into ECS; orbital tree layout; swarms; inspector; keyboard focus model; search; conformance suite |
+| **2** | **The Blackwall** | M | Wall shader driven by per-OS kernel-pressure signals; kernel monoliths with faded "no telemetry" variants; kthreads/drivers; cross-Wall streams from aggregate rates |
+| **3** | **Storage + Network** | M | Fortresses, volume rings and IO streams; socket → process beams and endpoint clusters on all three OSes |
+| **4** | **History & replay** | M | Bundled SQLite store with downsampling; `ReplaySource`; timeline; `.bwcap` export/import (and used as test fixtures) |
+| **5** | **Issues: rules** | M | TOML rules engine with capability gating; journald/kmsg, Event Log, and unified log/crash-report readers; alert feed; glitch visuals; fly-to-issue |
+| **6** | **Platform depth** | L | Deeper per-OS probes (PSI/vmstat, PDH, `host_statistics64`), SMART and temperatures where available, published capability matrix |
+| **7** | **ICE helper + tier-1 actions** | L | Helper installed and authenticated on each OS (polkit / Windows service / SMAppService), elevated read probes, kill/suspend/priority/reveal, hash-chained audit log, signed builds |
+| **8** | **Baselines & anomalies** | M | Hour-of-week profiles, novelty detectors, learning period, explanations, "this is normal" feedback |
+| **9** | **Immersion polish** | M | Synthesized sound, screensaver with system-idle detection and sleep inhibit, quality governor, gesture recognizer, reduced-motion, list view |
+| **10** | **Actions tiers 2–3** | M | Service control (systemd/SCM/launchd); firewall blocks (nftables/WFP/pf) with auto-expiry |
+| **11** | **Packaging & release** | M | MSI + winget, notarized universal DMG, AppImage/deb/rpm/AUR, release automation |
+| **12** | **Fleet-ready** | L | Headless `bw-agent` (engine-free crates only), `RemoteSource` over QUIC + mTLS, host switcher. A hub can come after this |
+| Later | eBPF syscall flows, ETW deep tracing, Windows `.scr`, wasm/WebGPU viewer for fleet, self-updater | — | — |
 
-Milestones 1–5 are **Linux-first** so that the visual and metaphor work isn't slowed down by three platforms at once. The `Collector` trait and capability flags keep the code ready for Milestone 6.
+Scheduled engine upgrades are slotted between milestones whenever a new Bevy minor version is out and `bevy_egui` supports it.
 
 ---
 
-## 14. Risks and mitigations
+## 15. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| WebKitGTK (Linux) WebGL performance or quirks | Milestone 0 spike first; Low tier designed for it; Bevy fallback kept on the table |
-| Visual clutter with 1,000+ processes | Aggregation: collapse sibling groups (e.g. browser renderer processes) into "swarms"; "issues only" and "top N" filters; semantic zoom |
-| Collector overhead distorting the system it measures | Tiered cadences; diff-based updates; CPU-budget benchmark in CI |
-| Full-control features being dangerous | Privilege-separated helper, allowlist, confirmations, audit log, protected list, auto-expiring firewall rules |
-| Cross-platform signing and helper installation are painful | Defer to Milestone 7; read-only mode works with no installation step at all |
-| Baseline false positives | Learning period, explanations, one-click "this is normal" feedback that updates the baseline |
-| Scope creep in a side project | Every milestone ships something usable; "Later" bucket stays later |
+| egui doesn't reach the desired cyberpunk polish | Go/no-go in Milestone 0; heavy theming plus Bevy UI overlays for the hero moments; panels behind a `bw-ui` boundary so they can be swapped |
+| Bevy breaking changes | Pinned versions, engine isolated to four crates, deliberate upgrade milestones |
+| GPU and driver diversity (old iGPUs, VMs, RDP, Wayland quirks) | GL-compatible Low tier, software-renderer detection, shader cross-compile in CI, render smoke tests on lavapipe and WARP |
+| Platform data parity (some data missing or privileged on some OSes) | Capability flags, honest "not available / restricted" states, opt-in elevated read probes, capability-gated rules |
+| Antivirus / Gatekeeper distrust of a process-killing tool | Code signing and notarization from Milestone 7; helper allowlist; clear docs |
+| Paid signing requirements (Apple Developer, Windows certificate) | Unsigned dev builds until Milestone 7/11; budget for the certificates before the first public release |
+| Linux distro fragmentation | Old-glibc builds, AppImage + deb/rpm, no hard systemd dependency, capability fallbacks |
+| Collector overhead | Tiered cadences, diff-based updates, CI CPU-budget benchmark on all OSes |
+| Visual clutter | Swarms, semantic zoom, filters, issues-only mode |
+| Scope creep | Every milestone ships on all three OSes and is usable; the "Later" bucket stays later |
 
 ---
 
-## 15. Open questions for later
+## 16. Open questions
 
-1. Name and branding of the helper (`blackwall-ice` is a placeholder).
-2. Should a disk-usage "terrain" (large directories as landscape) be part of storage, or a separate deep-dive mode? It's expensive to scan.
-3. Licensing (MIT/Apache-2.0 dual is the Rust norm).
-4. Should replay files be exportable, so a captured incident can be shared and replayed on another machine?
-5. Should the eventual fleet hub also serve the web UI (the same Svelte frontend), so it's reachable from a phone?
+1. Name of the helper (`blackwall-ice` is a placeholder).
+2. A disk-usage "terrain" (large directories as landscape): part of the storage view, or a separate deep-dive mode? Scanning is expensive and slow on network drives.
+3. License (MIT/Apache-2.0 dual is the Rust norm).
+4. Are you willing to pay for an Apple Developer account and a Windows signing certificate? These are needed for the full-control features on macOS and for antivirus trust on Windows.
+5. Is a WebAssembly/WebGPU viewer for the future fleet hub (phone access) worth keeping on the roadmap?
