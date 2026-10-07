@@ -236,26 +236,28 @@ If the user opts in, `blackwall-ice` runs these probes elevated and streams **re
 
 ## 6. The visual language
 
-### 6.1 Spatial layout
-- **The Blackwall**: a vast, curved, translucent hexagonal-lattice barrier (a custom WGSL material). Its turbulence tracks kernel pressure (PSI on Linux; equivalent signals elsewhere). Under critical pressure it **cracks and glitches**.
-- **Behind the Wall:** dim monoliths for the *Scheduler*, *Memory Manager*, *Storage/VFS*, *Network stack*, *Drivers* and *Interrupts*. Kernel threads and drivers are sparks clustered around them. A monolith with no data on the current OS is drawn as a faded silhouette labeled "no telemetry".
-- **Deep Space:** the process tree in orbital form. Init/launchd/services is the central star; children orbit their parents. Layout uses a stable, damped force simulation that runs in an ECS system. New processes materialize and exiting ones dissolve.
-- **Storage:** "data fortresses" at the Wall's edge, one per disk, with volumes as rings around them. IO is drawn as particle streams from a process, through the Wall, to its disk.
-- **Network:** interfaces are gates at the edge of space, with beams out to distant clusters of remote endpoints.
-- **Crossing the Wall:** syscalls, IO, page faults and interrupts are drawn as streams through the barrier. This is the core of the metaphor.
+> **v3 (decided with the user):** the look follows the Blackwall chamber in Cyberpunk 2077. Everything is drawn with **only dots, lines and streams of dots**: no solid shapes, no galaxy. The more data, the denser the dots. **Color encodes health only.**
 
-### 6.2 Encoding a process (redundant: never color alone)
+### 6.1 Spatial layout: a city of columns
+- **Floor:** a dim lattice of dots with a slow wave rolling toward the Wall.
+- **Deep Space (user space):** a city. Every process is a **column of dots**. Each process *tree* is a **district**: a block of columns in depth-first order, so families stand together. Districts are shelf-packed with streets between them and ~25% spare capacity, so churn doesn't reshape the city. One-process trees share a "suburb" block.
+- **The Blackwall:** a vast curtain of vertical streaks made of dots, just behind the city. Calm, it is violet-blue. Under kernel pressure the streaks speed up, crowd together, tear (glitch) and burn red.
+- **Behind the Wall (kernel space):** kernel threads as dimmer indigo columns, in one district per subsystem (*Scheduler*, *Memory*, *Storage*, *Kernel core*, *Network*, *Drivers*, *Interrupts*), visible through the additive curtain.
+- **Volumes:** tall 3×3 dot columns lined up in front of the Wall; lit dots are used space.
+- **Streams:** dots flow from a column's foot along the street, through the Wall, into the kernel district they talk to: disk IO to *Storage*, CPU work to *Scheduler*. Network flows join in Milestone 3.
+- **Selection:** the column turns white with a beam above it; its parent and children are joined by right-angled floor lines.
+
+### 6.2 Encoding a process
 | Property | Visual channel |
 |---|---|
-| Memory (RSS) | Size |
-| CPU % | Brightness and pulse rate |
-| Owner (system / current user / other) | Shape (octahedron / sphere / icosahedron) and base hue |
-| Zombie | Grey hollow husk that doesn't pulse |
-| Uninterruptible IO | Pulled toward the Wall, tethered to its disk |
-| Restricted (no access) | Wireframe shell with a lock glyph |
-| Issue / anomaly | Glitch shader, corruption particles, and a HUD marker with an icon |
+| Memory (RSS) | Column **height** (log scale) and **density** (1×1, 2×2 or 3×3 dots per level) |
+| CPU % | Brightness, plus pulses rising up the column faster as CPU grows |
+| Health | **Color only**: blue = healthy, violet = worth watching, red = issue (blinking). Health comes from `bw_model::Process::health()` for now and from the rules engine in Milestone 5 |
+| Kernel vs user | Which side of the Wall it stands on (plus an indigo tint and ▲ glyph in lists) |
+| Birth | The column grows upward from the floor |
+| Family | District membership; floor lines for the selection |
 
-**Scale:** sibling groups (e.g. 40 browser renderer processes) collapse into **swarms**, with semantic zoom to expand them. There are also "issues only" and "top N" filters.
+**Accessibility:** color is the only channel for health in the scene, so health is always repeated as text: the inspector's ⚠ line, the list, and "issues only" mode (key 5), which dims everything healthy. A pattern-based alternative (e.g. dashed columns for issues) is planned for the high-contrast theme.
 
 ### 6.3 HUD
 - **egui:** inspector (numbers, sparklines, open files and sockets, children, history, actions), alert feed, timeline scrubber, search / command palette, settings, legend, and a **list view of everything in the scene** for accessibility.

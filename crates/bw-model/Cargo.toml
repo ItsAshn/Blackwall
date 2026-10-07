@@ -1,0 +1,13 @@
+[package]
+name = "bw-model"
+description = "Platform- and engine-independent data model for Blackwall"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

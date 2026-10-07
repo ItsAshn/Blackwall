@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ItsAshn/Blackwall"
+
+[workspace.dependencies]
+bw-model = { path = "crates/bw-model" }
+bw-platform = { path = "crates/bw-platform" }
+bw-source = { path = "crates/bw-source" }
+bw-scene = { path = "crates/bw-scene" }
+bw-ui = { path = "crates/bw-ui" }
+
+# Engine: pinned exactly; upgrade deliberately (see docs/PLAN.md §2.2).
+bevy = "=0.19.1"
+bevy_egui = "=0.42.0"
+
+sysinfo = "0.39"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+
+# Fast enough dev builds for the engine while keeping our own code debuggable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[workspace.lints.clippy]
+# Bevy systems take many system params and complex queries by design.
+too_many_arguments = "allow"
+type_complexity = "allow"

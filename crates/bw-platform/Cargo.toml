@@ -1,0 +1,14 @@
+[package]
+name = "bw-platform"
+description = "Per-OS system probes behind one Collector trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bw-model.workspace = true
+sysinfo.workspace = true
+
+[lints]
+workspace = true

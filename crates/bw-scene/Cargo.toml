@@ -1,0 +1,19 @@
+[package]
+name = "bw-scene"
+description = "Blackwall's 3D scene (Bevy): Deep Space, the Wall and the kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+bw-model.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+bw-source.workspace = true
+bw-platform.workspace = true
+
+[lints]
+workspace = true
