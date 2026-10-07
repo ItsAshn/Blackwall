@@ -5,7 +5,7 @@
 //! forced from the command line or settings disables the governor.
 
 use crate::camera::MainCamera;
-use bevy::post_process::bloom::Bloom;
+use bevy::post_process::bloom::{Bloom, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
 use bevy::render::view::Msaa;
@@ -49,7 +49,7 @@ impl Tier {
     }
 
     fn bloom(self) -> Option<f32> {
-        [None, Some(0.12), Some(0.16), Some(0.2)][self as usize]
+        [None, Some(0.3), Some(0.38), Some(0.45)][self as usize]
     }
 
     fn msaa(self) -> Msaa {
@@ -218,6 +218,13 @@ fn apply(
         Some(intensity) => {
             commands.entity(cam).insert(Bloom {
                 intensity,
+                // Only real light blooms, so the void stays pure black while
+                // the bright dots spill neon around them.
+                low_frequency_boost: 0.55,
+                prefilter: BloomPrefilter {
+                    threshold: 0.55,
+                    threshold_softness: 0.4,
+                },
                 ..Bloom::NATURAL
             });
         }

@@ -4,13 +4,36 @@
 //   brightness + rising pulses: CPU; the brightest dots burn to a white core
 //   dot count: memory
 //
+// Each dot is a camera-facing quad (four corners at the dot's center, spread
+// out here) drawn as a hot round core in a soft halo, blended additively.
+//
 // Per-vertex data (see city.rs):
+//   normal = (corner x, corner y, quad half-size)
 //   uv    = (cpu 0..1 | volume used flag | floor rank 0..1, height fraction 0..1)
 //   uv_b  = (column id, kind)
 //   color = (linear rgb, birth time | death time)
 // Must compile on every wgpu backend, including GL (PLAN §3.3).
 
-#import bevy_pbr::forward_io::VertexOutput
+#import bevy_pbr::mesh_functions::get_world_from_local
+#import bevy_pbr::mesh_view_bindings::view
+
+struct Vertex {
+    @builtin(instance_index) instance_index: u32,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) uv_b: vec2<f32>,
+    @location(5) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) corner: vec2<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) uv_b: vec2<f32>,
+    @location(4) color: vec4<f32>,
+};
 
 struct DotParams {
     // x: time, y: pressure, z: selected column id (-1 none), w: hovered id
@@ -48,20 +71,40 @@ fn burn(rgb: vec3<f32>, b: f32) -> vec3<f32> {
     return mix(lit, vec3<f32>(b), clamp((b - 1.0) * 0.35, 0.0, 0.7));
 }
 
+@vertex
+fn vertex(v: Vertex) -> VertexOutput {
+    var out: VertexOutput;
+    let center = (get_world_from_local(v.instance_index) * vec4<f32>(v.position, 1.0)).xyz;
+    // Billboard in view space, so every dot is round from any angle.
+    let in_view = view.view_from_world * vec4<f32>(center, 1.0);
+    let spread = vec4<f32>(v.normal.xy * v.normal.z, 0.0, 0.0);
+    out.clip = view.clip_from_view * (in_view + spread);
+    out.world_position = center;
+    out.corner = v.normal.xy;
+    out.uv = v.uv;
+    out.uv_b = v.uv_b;
+    out.color = v.color;
+    return out;
+}
+
+// A point of light: a small disc burning white at its heart, inside a halo
+// that falls off softly into the black. 1.0 is the quad's edge.
+fn glow(corner: vec2<f32>) -> vec2<f32> {
+    let d = length(corner);
+    let core = (1.0 - smoothstep(0.08, 0.17, d)) + exp(-d * d * 260.0) * 0.8;
+    let halo = exp(-d * d * 10.0) * 0.16 + exp(-d * d * 45.0) * 0.7;
+    return vec2<f32>(core, halo * (1.0 - smoothstep(0.85, 1.0, d)));
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    var uv = vec2<f32>(0.0);
-    var ub = vec2<f32>(-10.0, 0.0);
-    var col = vec4<f32>(1.0, 1.0, 1.0, 0.0);
-#ifdef VERTEX_UVS_A
-    uv = in.uv;
-#endif
-#ifdef VERTEX_UVS_B
-    ub = in.uv_b;
-#endif
-#ifdef VERTEX_COLORS
-    col = in.color;
-#endif
+    let uv = in.uv;
+    let ub = in.uv_b;
+    let col = in.color;
+    let g = glow(in.corner);
+    if (g.x + g.y < 0.004) {
+        discard;
+    }
     let t = params.a.x;
     let reduced = params.b.w > 0.5;
     let id = ub.x;
@@ -137,5 +180,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Distance fog into the void: nothing has an edge or a horizon.
     let r = length(in.world_position.xz);
     let fog = 1.0 - smoothstep(params.d.x, params.d.y, r);
-    return vec4<f32>(rgb * params.b.y * fog, 1.0);
+    // The core keeps the dot's light (and burns whiter); the halo carries its
+    // hue out into the dark. Alpha 0: additive (premultiplied) blending.
+    let core = mix(rgb, vec3<f32>(max(rgb.r, max(rgb.g, rgb.b))), 0.25) * g.x * 1.6;
+    let light = core + rgb * g.y;
+    return vec4<f32>(light * params.b.y * fog, 0.0);
 }

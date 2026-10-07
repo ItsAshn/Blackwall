@@ -14,9 +14,13 @@ use crate::palette::{self, linear};
 use crate::*;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::camera::visibility::NoFrustumCulling;
-use bevy::mesh::Indices;
+use bevy::mesh::{Indices, MeshVertexBufferLayoutRef};
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::reflect::TypePath;
-use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology, ShaderType};
+use bevy::render::render_resource::{
+    AsBindGroup, PrimitiveTopology, RenderPipelineDescriptor, ShaderType,
+    SpecializedMeshPipelineError,
+};
 use bevy::shader::ShaderRef;
 use bw_model::{Health, Process, Realm};
 
@@ -59,8 +63,27 @@ pub struct DotsMaterial {
 }
 
 impl Material for DotsMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "embedded://bw_scene/shaders/dots.wgsl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "embedded://bw_scene/shaders/dots.wgsl".into()
+    }
+
+    /// Light adds to light: overlapping halos build up like neon.
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+
+    fn specialize(
+        _: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _: &MeshVertexBufferLayoutRef,
+        _: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
 }
 
@@ -97,12 +120,16 @@ const DISSOLVE_SECS: f32 = 1.2;
 /// Upper bound on floor dots; above it each dot stands for more RAM.
 const MAX_FLOOR_DOTS: u64 = 12_000;
 
+/// A dot's quad is this many times its core's half-size: the rest is halo.
+const GLOW: f32 = 4.0;
+
 /// Volume columns get ids above any process column.
 pub const VOLUME_ID_BASE: usize = 1_000_000;
 
 #[derive(Default)]
 pub(crate) struct DotMesh {
     pos: Vec<[f32; 3]>,
+    normal: Vec<[f32; 3]>,
     uv: Vec<[f32; 2]>,
     uv_b: Vec<[f32; 2]>,
     color: Vec<[f32; 4]>,
@@ -110,38 +137,27 @@ pub(crate) struct DotMesh {
 }
 
 impl DotMesh {
-    /// A small axis-aligned cube: the dots are square, like the reference.
-    pub(crate) fn cube(&mut self, c: Vec3, h: f32, uv: [f32; 2], uv_b: [f32; 2], color: [f32; 4]) {
+    /// One point of light: a camera-facing quad that `dots.wgsl` turns into
+    /// a hot round core inside a soft halo. All four corners share the dot's
+    /// center; the normal carries the corner and the quad's half-size, and the
+    /// vertex shader spreads them out to face the camera.
+    pub(crate) fn dot(&mut self, c: Vec3, h: f32, uv: [f32; 2], uv_b: [f32; 2], color: [f32; 4]) {
         let base = self.pos.len() as u32;
-        for i in 0..8 {
-            let o = Vec3::new(
-                if i & 1 == 0 { -h } else { h },
-                if i & 2 == 0 { -h } else { h },
-                if i & 4 == 0 { -h } else { h },
-            );
-            self.pos.push((c + o).to_array());
+        let size = h * GLOW;
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            self.pos.push(c.to_array());
+            self.normal.push([x, y, size]);
             self.uv.push(uv);
             self.uv_b.push(uv_b);
             self.color.push(color);
         }
-        const F: [[u32; 4]; 6] = [
-            [0, 2, 3, 1],
-            [4, 5, 7, 6],
-            [0, 1, 5, 4],
-            [2, 6, 7, 3],
-            [0, 4, 6, 2],
-            [1, 3, 7, 5],
-        ];
-        for f in F {
-            self.idx
-                .extend([f[0], f[1], f[2], f[0], f[2], f[3]].map(|v| base + v));
-        }
+        self.idx.extend([0, 1, 2, 0, 2, 3].map(|v| base + v));
     }
 
     pub(crate) fn into_mesh(mut self) -> Mesh {
         // Never upload an empty mesh: park one dot far below the floor.
         if self.pos.is_empty() {
-            self.cube(
+            self.dot(
                 Vec3::new(0.0, -1000.0, 0.0),
                 0.01,
                 [0.0, 0.0],
@@ -154,6 +170,7 @@ impl DotMesh {
             RenderAssetUsages::default(),
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normal)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uv)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, self.uv_b)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.color)
@@ -214,7 +231,7 @@ fn column_dots(
                     level as f32 * LEVEL_H + half,
                     (fz as f32 - (fp - 1) as f32 / 2.0) * spacing,
                 );
-                m.cube(
+                m.dot(
                     c.base + off,
                     half,
                     [cpu, hfrac],
@@ -320,7 +337,7 @@ fn rebuild_city(
                         fz as f32 * 0.2,
                     );
                     let lit = if level < used { 1.0 } else { 0.0 };
-                    dm.cube(
+                    dm.dot(
                         base + off,
                         0.045,
                         [lit, 0.0],
@@ -398,7 +415,7 @@ fn rebuild_floor(
     let mut dm = DotMesh::default();
     for (i, p) in pts.iter().enumerate() {
         let rank = (i as f32 + 0.5) / n as f32;
-        dm.cube(
+        dm.dot(
             Vec3::new(p.x, -0.02, p.y),
             0.022,
             [rank, 0.0],
@@ -514,7 +531,7 @@ pub(crate) fn interior_mesh(
                             y,
                             ang.sin() * interior::CORE_R,
                         );
-                        m.cube(
+                        m.dot(
                             pos,
                             0.045,
                             [0.12, lv as f32 / levels as f32],
@@ -537,12 +554,12 @@ pub(crate) fn interior_mesh(
                     Vec3::new(-h, y, -h),
                 ];
                 interior::along(&corners, 0.3, |p, u| {
-                    m.cube(p, 0.05, [cpu, u], [id, kind], col)
+                    m.dot(p, 0.05, [cpu, u], [id, kind], col)
                 });
             }
             ElementKind::Conduit { .. } => {
                 interior::along(&e.path, 0.32, |p, u| {
-                    m.cube(p, 0.035, [0.3, u], [id, KIND_FLOW], col)
+                    m.dot(p, 0.035, [0.3, u], [id, KIND_FLOW], col)
                 });
             }
             ElementKind::Satellite { child } => {
@@ -559,7 +576,7 @@ pub(crate) fn interior_mesh(
                     column_dots(&mut m, ELEMENT_ID_BASE + i, &column, crgb, ckind, cpu, b);
                 }
                 interior::along(&e.path, 0.4, |p, u| {
-                    m.cube(p, 0.03, [0.1, u], [id, KIND_FLOW], col)
+                    m.dot(p, 0.03, [0.1, u], [id, KIND_FLOW], col)
                 });
             }
         }

@@ -85,7 +85,7 @@ fn setup(
     mut mats: ResMut<Assets<StandardMaterial>>,
     quality: Res<Quality>,
 ) {
-    let mesh = meshes.add(Cuboid::from_length(1.0));
+    let mesh = meshes.add(Sphere::new(0.5).mesh().ico(1).unwrap());
     let ok = emissive(&mut mats, health_color(Health::Healthy, Realm::User), 6.0);
     let bad = emissive(&mut mats, health_color(Health::Critical, Realm::User), 8.0);
     for i in 0..quality.tier.particle_budget() {
