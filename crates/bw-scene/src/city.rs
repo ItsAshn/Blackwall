@@ -9,7 +9,7 @@
 use crate::camera::JackIn;
 use crate::explore::MachineLayer;
 use crate::interior::{self, ELEMENT_ID_BASE, ElementKind, Interior};
-use crate::layout::{self as lay, Column, LEVEL_H, WINDOW};
+use crate::layout::LEVEL_H;
 use crate::palette::{self, linear};
 use crate::*;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
@@ -22,7 +22,7 @@ use bevy::render::render_resource::{
     SpecializedMeshPipelineError,
 };
 use bevy::shader::ShaderRef;
-use bw_model::{Health, Process, Realm};
+use bw_model::{Health, Realm};
 
 pub(crate) fn plugin(app: &mut App) {
     embedded_asset!(app, "shaders/dots.wgsl");
@@ -107,11 +107,9 @@ pub(crate) struct CityHandles {
 }
 
 const KIND_PROCESS: f32 = 0.0;
-const KIND_KERNEL: f32 = 1.0;
 const KIND_VOLUME: f32 = 2.0;
 const KIND_FLOOR: f32 = 3.0;
 const KIND_CRITICAL: f32 = 4.0;
-const KIND_DYING: f32 = 5.0;
 const KIND_FLOW: f32 = 6.0;
 const KIND_WATCH: f32 = 7.0;
 const KIND_BEACON: f32 = 8.0;
@@ -123,18 +121,12 @@ const KIND_STRATUM: f32 = 11.0;
 /// can be seen from anywhere in the city.
 const BEACON_RISE: f32 = 30.0;
 
-/// How long an exited process takes to dissolve.
-const DISSOLVE_SECS: f32 = 1.2;
-/// Upper bound on floor dots; above it each dot stands for more RAM.
-const MAX_FLOOR_DOTS: u64 = 12_000;
-
 /// A dot's quad is this many times its core's half-size: the rest is halo.
 const GLOW: f32 = 4.0;
 
 /// Volume columns get ids above any process column.
 pub const VOLUME_ID_BASE: usize = 1_000_000;
 
-#[derive(Default)]
 pub(crate) struct DotMesh {
     pos: Vec<[f32; 3]>,
     normal: Vec<[f32; 3]>,
@@ -142,16 +134,40 @@ pub(crate) struct DotMesh {
     uv_b: Vec<[f32; 2]>,
     color: Vec<[f32; 4]>,
     idx: Vec<u32>,
+    /// Where the dots are placed: positions and sizes are scaled by `scale`
+    /// and moved to `origin` (an interior standing in its tower's plot).
+    origin: Vec3,
+    scale: f32,
+}
+
+impl Default for DotMesh {
+    fn default() -> Self {
+        Self::framed(Vec3::ZERO, 1.0)
+    }
 }
 
 impl DotMesh {
+    pub(crate) fn framed(origin: Vec3, scale: f32) -> Self {
+        Self {
+            pos: vec![],
+            normal: vec![],
+            uv: vec![],
+            uv_b: vec![],
+            color: vec![],
+            idx: vec![],
+            origin,
+            scale,
+        }
+    }
+
     /// One point of light: a camera-facing quad that `dots.wgsl` turns into
     /// a hot round core inside a soft halo. All four corners share the dot's
     /// center; the normal carries the corner and the quad's half-size, and the
     /// vertex shader spreads them out to face the camera.
     pub(crate) fn dot(&mut self, c: Vec3, h: f32, uv: [f32; 2], uv_b: [f32; 2], color: [f32; 4]) {
         let base = self.pos.len() as u32;
-        let size = h * GLOW;
+        let size = h * GLOW * self.scale;
+        let c = self.origin + c * self.scale;
         for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
             self.pos.push(c.to_array());
             self.normal.push([x, y, size]);
@@ -204,100 +220,6 @@ fn setup(
         ));
     }
     commands.insert_resource(CityHandles { city, floor, mat });
-}
-
-/// What a column looked like, kept so it can dissolve after its process exits.
-#[derive(Clone)]
-struct Ghost {
-    column: Column,
-    rgb: [f32; 3],
-    died: f32,
-}
-
-/// A tower as a brutalist facade: windows on its four faces only, one row
-/// per level. The shader lights a share of the windows equal to the CPU; the
-/// rest stay barely visible, so the mass (memory) still reads. At each memory
-/// ledge (10 MB, 100 MB, 1 GB…) a ledge line runs round the tower and it
-/// steps in by a window, alternating sides; the roof gets a ledge too.
-pub(crate) fn tower_dots(
-    m: &mut DotMesh,
-    id: usize,
-    c: &Column,
-    rgb: [f32; 3],
-    kind: f32,
-    cpu: f32,
-    time: f32,
-) {
-    let half = if c.realm == Realm::Kernel {
-        0.035
-    } else {
-        0.042
-    };
-    let col = [rgb[0], rgb[1], rgb[2], time];
-    let ledges: Vec<u32> = lay::ledges(c.levels).collect();
-    // The block still standing: offset and size in windows.
-    let (mut ox, mut oz, mut ex, mut ez) = (0, 0, c.wx as i32, c.wz as i32);
-    let first = c.base - Vec3::new(c.half().x, 0.0, c.half().y)
-        + Vec3::new(WINDOW / 2.0, 0.0, WINDOW / 2.0);
-    let ledge = |m: &mut DotMesh, ox: i32, oz: i32, ex: i32, ez: i32, level: u32| {
-        let y = level as f32 * LEVEL_H - 0.05;
-        let lo = first
-            + Vec3::new(
-                (ox as f32 - 0.5) * WINDOW - 0.04,
-                y,
-                (oz as f32 - 0.5) * WINDOW - 0.04,
-            );
-        let hi = first
-            + Vec3::new(
-                ((ox + ex) as f32 - 0.5) * WINDOW + 0.04,
-                y,
-                ((oz + ez) as f32 - 0.5) * WINDOW + 0.04,
-            );
-        let hf = level as f32 / c.levels as f32;
-        let path = [
-            lo,
-            Vec3::new(hi.x, lo.y, lo.z),
-            Vec3::new(hi.x, lo.y, hi.z),
-            Vec3::new(lo.x, lo.y, hi.z),
-            lo,
-        ];
-        interior::along(&path, 0.1, |p, _| {
-            m.dot(p, half * 0.55, [0.0, hf], [id as f32, KIND_LEDGE], col)
-        });
-    };
-    let mut step = 0;
-    for level in 0..c.levels {
-        if ledges.contains(&level) {
-            ledge(m, ox, oz, ex, ez, level);
-            // Step in by one window: x on even ledges, z on odd ones.
-            if step % 2 == 0 {
-                if ex > 2 {
-                    ex -= 1;
-                    ox += step / 2 % 2;
-                }
-            } else if ez > 2 {
-                ez -= 1;
-                oz += step / 2 % 2;
-            }
-            step += 1;
-        }
-        let hfrac = (level as f32 + 0.5) / c.levels as f32;
-        for ix in 0..ex {
-            for iz in 0..ez {
-                if ix > 0 && ix < ex - 1 && iz > 0 && iz < ez - 1 {
-                    continue;
-                }
-                let p = first
-                    + Vec3::new(
-                        (ox + ix) as f32 * WINDOW,
-                        level as f32 * LEVEL_H + half,
-                        (oz + iz) as f32 * WINDOW,
-                    );
-                m.dot(p, half, [cpu, hfrac], [id as f32, kind], col);
-            }
-        }
-    }
-    ledge(m, ox, oz, ex, ez, c.levels);
 }
 
 /// A beam of light climbing from `from` into the dark: issues are visible
@@ -361,21 +283,8 @@ pub(crate) fn conduit(
     });
 }
 
-fn process_look(p: &Process, realm: Realm) -> ([f32; 3], f32, f32) {
-    let health = p.health();
-    let kind = match (health, realm) {
-        (Health::Critical, _) => KIND_CRITICAL,
-        (_, Realm::Kernel) => KIND_KERNEL,
-        _ => KIND_PROCESS,
-    };
-    (
-        health_color(health, realm),
-        kind,
-        // The share of windows lit: CPU, linear, so it can be read.
-        (p.cpu_pct / 100.0).clamp(0.0, 1.0),
-    )
-}
-
+/// The light layer over the solid towers: beacons over issues, family
+/// cables between towers, disk-IO conduits to the volumes, the volumes.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_city(
     m: Res<Machine>,
@@ -387,112 +296,74 @@ fn rebuild_city(
     mut born: ResMut<Born>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_gen: Local<u64>,
-    mut last_seen: Local<HashMap<ProcKey, Ghost>>,
-    mut ghosts: Local<Vec<Ghost>>,
 ) {
     if m.generation == *last_gen && !settings.is_changed() {
         return;
     }
-    let fresh = m.generation != *last_gen;
     *last_gen = m.generation;
     let now = time.elapsed_secs();
     let first = born.0.is_empty();
-    // On the first frame the city resolves out of black row by row from the
-    // Wall outward, after the jack-in's fall through the rain.
-    let start = if first { now + jack.city_delay() } else { now };
-
-    // Processes that exited since the last update start dissolving.
-    if fresh {
-        for (k, g) in last_seen.drain() {
-            if !m.snapshot.processes.contains_key(&k) {
-                ghosts.push(Ghost { died: now, ..g });
-            }
-        }
-    }
-    ghosts.retain(|g| now - g.died < DISSOLVE_SECS);
+    let start = if first {
+        now + jack.city_delay() + 1.0
+    } else {
+        now
+    };
     born.0.retain(|k, _| m.snapshot.processes.contains_key(k));
 
+    let lay = &sl.layout;
     let mut dm = DotMesh::default();
-    for (id, c) in sl.layout.columns.iter().enumerate() {
+    for (id, c) in lay.columns.iter().enumerate() {
         let Some(p) = m.snapshot.processes.get(&c.key) else {
             continue;
         };
-        let b = *born.0.entry(c.key).or_insert(if first {
-            start + (c.base.z - sl.layout.min.y).max(0.0) * 0.05
-        } else {
-            now
-        });
-        let (rgb, kind, cpu) = process_look(p, c.realm);
-        tower_dots(&mut dm, id, c, rgb, kind, cpu, b);
+        let b = *born
+            .0
+            .entry(c.key)
+            .or_insert(if first { start } else { now });
         let health = p.health();
-        if health != Health::Healthy && c.realm == Realm::User {
+        let rgb = health_color(health, c.realm);
+        if health != Health::Healthy {
             beacon(&mut dm, id, c.top(), BEACON_RISE, health, b);
         }
-        // Family: a cable from the parent's tower to this one.
-        if let Some(pc) = p
-            .parent
-            .and_then(|pk| sl.layout.column(&pk))
-            .filter(|pc| settings.show_links && pc.realm == Realm::User && c.realm == Realm::User)
+        // Family: a cable from the parent's roof to the child's.
+        if settings.show_links
+            && let Some(pc) = p.parent.and_then(|pk| lay.column(&pk))
         {
-            let h = pc.height().min(c.height()) * 0.85;
+            let h = pc.height().min(c.height());
             cable(
                 &mut dm,
                 id,
-                pc.base + Vec3::Y * h,
-                c.base + Vec3::Y * h,
+                pc.base() + Vec3::Y * h,
+                c.base() + Vec3::Y * h,
                 health_color(Health::Healthy, Realm::User),
                 b,
             );
         }
-        // Disk IO: a conduit along the floor to the storage it lands on.
+        // Disk IO: down the tower's face and along the floor to storage.
         let io = (p.io_read_bytes + p.io_write_bytes) as f32;
         if settings.show_streams
-            && c.realm == Realm::User
             && !m.snapshot.volumes.is_empty()
             && (io > 4096.0 || p.state == bw_model::ProcState::DiskWait)
         {
-            // Down the tower's face, along its alley, then up the city's
-            // west edge in a trunk of parallel lanes to the volumes.
-            let v = sl.layout.volume_base(0);
+            let v = lay.volume_base(0);
             let y = 0.03;
-            let lane = ((p.key.pid % 9) as f32 - 4.0) * 0.06;
-            let face = c.base + Vec3::new(lane * 0.5, 0.0, c.half().y + 0.06);
-            let alley = face.z + 0.42 + lane * 0.3;
-            let trunk = sl.layout.min.x - 0.6 + lane;
+            let lane = ((p.key.pid % 9) as f32 - 4.0) * 0.07;
+            let foot = Vec3::new(c.base().x + lane * 0.3, y, c.max.y + 0.04);
             let path = [
-                face + Vec3::Y * c.height() * 0.5,
-                face + Vec3::Y * y,
-                Vec3::new(face.x, y, alley),
-                Vec3::new(trunk, y, alley),
-                Vec3::new(trunk, y, v.z + lane),
-                Vec3::new(v.x, y, v.z + lane),
+                foot + Vec3::Y * c.height() * 0.5,
+                foot,
+                Vec3::new(foot.x, y, lay.max.y + 0.9 + lane),
+                Vec3::new(v.x + lane, y, lay.max.y + 0.9 + lane),
+                Vec3::new(v.x + lane, y, v.z),
             ];
             let rate = ((io / 4096.0).max(1.0).log10() / 4.0).clamp(0.0, 1.0);
             conduit(&mut dm, id, &path, rate, rgb, b);
         }
-        last_seen.insert(
-            c.key,
-            Ghost {
-                column: c.clone(),
-                rgb,
-                died: 0.0,
-            },
-        );
     }
-    for g in ghosts.iter() {
-        tower_dots(
-            &mut dm,
-            2 * VOLUME_ID_BASE,
-            &g.column,
-            g.rgb,
-            KIND_DYING,
-            0.0,
-            g.died,
-        );
-    }
-    // Volumes: tall 3×3 columns; lit dots are used space, the rest dot-off.
+    // Volumes: dense 3×3 columns outside the RAM square; lit dots are used
+    // space, the rest dot-off.
     for (i, v) in m.snapshot.volumes.iter().enumerate() {
-        let base = sl.layout.volume_base(i);
+        let base = lay.volume_base(i);
         let levels = (8.0 + (v.total_bytes as f32 / (1u64 << 30) as f32).max(1.0).log2() * 2.0)
             .round() as u32;
         let used = (v.used_pct() / 100.0 * levels as f32).round() as u32;
@@ -522,85 +393,57 @@ fn rebuild_city(
     }
 }
 
-/// The floor is the machine's RAM: one dot per `mb_per_dot`, the dots
-/// nearest the city first, so used memory lights up from the city outward.
+/// The floor is the machine's RAM: a square of dots under the whole map.
+/// Dots under memory in use are faintly lit; free memory is unlit ground.
 fn rebuild_floor(
     m: Res<Machine>,
     sl: Res<SceneLayout>,
     handles: Res<CityHandles>,
     mut info: ResMut<FloorInfo>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut last: Local<Option<(Vec2, Vec2, u64)>>,
+    mut last: Local<u64>,
 ) {
-    let total = m.snapshot.system.mem_total;
-    let key = (sl.layout.min, sl.layout.max, total);
-    if total == 0 || *last == Some(key) {
+    if m.generation == *last || sl.layout.extent <= 0.0 {
         return;
     }
-    *last = Some(key);
-
-    let mut mb = 64u64;
-    while total / (mb << 20) > MAX_FLOOR_DOTS {
-        mb *= 2;
-    }
-    let n = (total / (mb << 20)).max(16) as usize;
-    // Spread the dots over the city's footprint plus a margin, at whatever
-    // pitch makes them fit, then keep the n nearest the center.
-    let (min, max) = (
-        sl.layout.min - Vec2::splat(4.0),
-        sl.layout.max + Vec2::splat(6.0),
-    );
-    let area = (max - min).x * (max - min).y;
-    let pitch = (area / n as f32).sqrt().clamp(0.22, 3.0);
-    let mut pts = Vec::new();
-    let mut z = min.y;
-    while z <= max.y {
-        let mut x = min.x;
-        while x <= max.x {
-            pts.push(Vec2::new(x + pitch * 0.5, z + pitch * 0.5));
-            x += pitch;
-        }
-        z += pitch;
-    }
-    // Pad outward if the footprint ran short.
-    let mut ring = 1.0;
-    while pts.len() < n {
-        let r = (max - min).max_element() * 0.5 + ring * pitch;
-        let steps = (std::f32::consts::TAU * r / pitch) as usize;
-        pts.extend(
-            (0..steps)
-                .map(|i| Vec2::from_angle(i as f32 / steps as f32 * std::f32::consts::TAU) * r),
-        );
-        ring += 1.0;
-    }
-    let center = (sl.layout.min + sl.layout.max) * 0.5;
-    pts.sort_by(|a, b| {
-        a.distance_squared(center)
-            .total_cmp(&b.distance_squared(center))
-    });
-    pts.truncate(n);
-
+    *last = m.generation;
+    let lay = &sl.layout;
+    let side = lay.extent * 2.0;
+    let n = 110usize;
+    let pitch = side / n as f32;
+    let free: Vec<&crate::layout::Block> = lay
+        .blocks
+        .iter()
+        .filter(|b| b.kind == crate::layout::BlockKind::Free)
+        .collect();
     let ok = health_color(Health::Healthy, Realm::User);
     let mut dm = DotMesh::default();
-    for (i, p) in pts.iter().enumerate() {
-        let rank = (i as f32 + 0.5) / n as f32;
-        dm.dot(
-            Vec3::new(p.x, -0.02, p.y),
-            0.022,
-            [rank, 0.0],
-            [-5.0, KIND_FLOOR],
-            [ok[0], ok[1], ok[2], 0.0],
-        );
+    for ix in 0..n {
+        for iz in 0..n {
+            let p = lay.min + Vec2::new(ix as f32 + 0.5, iz as f32 + 0.5) * pitch;
+            let is_free = free
+                .iter()
+                .any(|b| p.cmpge(b.min).all() && p.cmplt(b.max).all());
+            dm.dot(
+                Vec3::new(p.x, -0.02, p.y),
+                0.02,
+                [if is_free { 0.99 } else { 0.0 }, 0.0],
+                [-5.0, KIND_FLOOR],
+                [ok[0], ok[1], ok[2], 0.0],
+            );
+        }
     }
+    let total = m.snapshot.system.mem_total;
     *info = FloorInfo {
-        mb_per_dot: mb,
-        dots: n,
+        mb_per_dot: total / (n * n) as u64 / 1_048_576,
+        dots: n * n,
     };
     if let Some(mut mesh) = meshes.get_mut(&handles.floor) {
         *mesh = dm.into_mesh();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_params(
     m: Res<Machine>,
     sl: Res<SceneLayout>,
@@ -620,7 +463,7 @@ fn update_params(
     let Some(mut mat) = mats.get_mut(&handles.mat) else {
         return;
     };
-    // Under reduced motion time stops, far enough in that every column has grown.
+    // Under reduced motion time stops, far enough in that everything has grown.
     let t = if settings.reduced_motion {
         1e5
     } else {
@@ -650,14 +493,10 @@ fn update_params(
         if settings.reduced_motion { 1.0 } else { 0.0 },
     );
     mat.params.c = palette::linear4(palette::DOT_OFF, 0.0);
-    // Fog from the eye, scaled to how far out the camera stands: close in,
-    // the city crowds round and its far side is lost in the dark.
-    let cd = cam.dist;
-    mat.params.d = if ex.inside().is_some() {
-        Vec4::new(cd * 1.1 + 16.0, cd * 2.4 + 45.0, 0.0, 0.0)
-    } else {
-        Vec4::new(cd * 0.8 + 4.0, cd * 1.9 + 16.0, 0.0, 0.0)
-    };
+    // Fog from the eye, and a near fade scaled to the zoom.
+    let (fs, fe) = crate::camera::fog(&cam);
+    let near = cam.dist * 0.04;
+    mat.params.d = Vec4::new(fs, fe, near, near * 4.0);
 }
 
 /// The builder for dot meshes, shared with the interior.
@@ -675,11 +514,12 @@ fn element_kind(h: Health) -> f32 {
 pub(crate) fn interior_mesh(
     it: &Interior,
     d: &bw_model::ProcessDetail,
-    snap: &bw_model::Snapshot,
     born: f32,
     _now: f32,
+    origin: Vec3,
+    scale: f32,
 ) -> Mesh {
-    let mut m = DotMesh::default();
+    let mut m = DotMesh::framed(origin, scale);
     let per_face = (2.0 * interior::CORE_R / interior::CORE_WINDOW).round() as usize;
     for (i, e) in it.elements.iter().enumerate() {
         let id = ELEMENT_ID_BASE + i;
@@ -774,17 +614,8 @@ pub(crate) fn interior_mesh(
             ElementKind::Conduit { .. } => {
                 conduit(&mut m, id, &e.path, 0.6, rgb, b);
             }
-            ElementKind::Satellite { child } => {
-                if let Some(c) = snap.processes.get(child) {
-                    let base = (e.min + e.max) * 0.5;
-                    let column = Column::for_process(c, Vec3::new(base.x, 0.0, base.z));
-                    let (crgb, ckind, cpu) = process_look(c, c.realm);
-                    tower_dots(&mut m, id, &column, crgb, ckind, cpu, b);
-                }
-                if let [a, z] = e.path[..] {
-                    cable(&mut m, id, a, z, rgb, b);
-                }
-            }
+            // Children are towers of their own on the map.
+            ElementKind::Satellite { .. } => {}
         }
         // Anything wrong raises a beacon over the whole interior.
         if e.health != Health::Healthy {

@@ -42,7 +42,7 @@ struct DotParams {
     b: vec4<f32>,
     // rgb: dot-off (linear), w: unused
     c: vec4<f32>,
-    // x: fog start, y: fog end (world units from the eye), zw: unused
+    // x: fog start, y: fog end, z: near fade start, w: near fade end (from the eye)
     d: vec4<f32>,
 };
 
@@ -123,8 +123,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var rgb: vec3<f32>;
     if (is_kind(kind, KIND_FLOOR)) {
-        // RAM: dots ranked from the city outward; the first `used` share are lit.
-        if (uv.x < params.b.z) {
+        // RAM: dots over memory in use are faintly lit; free memory is unlit.
+        if (uv.x < 0.5) {
             rgb = col.rgb * 0.32;
         } else {
             rgb = params.c.rgb;
@@ -212,10 +212,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Fog into the void, by distance from the eye: the city crowds in and
     // its far side sinks into black. Nothing has an edge or a horizon.
     let r = distance(in.world_position, view.world_position);
-    let fog = (1.0 - smoothstep(params.d.x, params.d.y, r)) * smoothstep(0.6, 2.5, r);
+    let fog = (1.0 - smoothstep(params.d.x, params.d.y, r)) * smoothstep(params.d.z, params.d.w, r);
+    // Vignette: the frame's edges sink, as on the towers.
+    let sp = (in.clip.xy - view.viewport.xy) / view.viewport.zw - vec2<f32>(0.5);
+    let vig = 1.0 - smoothstep(0.32, 0.78, length(sp * vec2<f32>(1.25, 1.0)));
     // The core keeps the dot's light (and burns whiter); the halo carries its
     // hue out into the dark. Alpha 0: additive (premultiplied) blending.
     let core = mix(rgb, vec3<f32>(max(rgb.r, max(rgb.g, rgb.b))), 0.25) * g.x * 1.6;
     let light = core + rgb * g.y;
-    return vec4<f32>(light * params.b.y * fog, 0.0);
+    return vec4<f32>(light * params.b.y * fog * vig, 0.0);
 }

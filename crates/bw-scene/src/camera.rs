@@ -1,17 +1,26 @@
-//! Orbit camera with mouse, touch and keyboard control (PLAN §10).
+//! Semantic zoom: one continuous map, from the whole machine down into a
+//! single process.
 //!
-//! Keyboard movement uses *physical* keys (layout-independent); character
-//! shortcuts live in the UI and use logical keys (PLAN §3.4).
+//! * Drag (left or middle button, one finger) pans the ground.
+//! * Scroll, pinch, +/− zoom toward the cursor. The view tilts with the
+//!   zoom: a steep map from far out, a low street-level look close in.
+//! * Right-drag or Q/E turns; right-drag up/down adjusts the tilt.
+//! * WASD or the arrow keys pan.
+//!
+//! Choosing and opening towers lives in `explore.rs`; this module only moves
+//! the eye. Keyboard movement uses *physical* keys (layout-independent);
+//! character shortcuts live in the UI and use logical keys (PLAN §3.4).
 
 use crate::*;
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::input::touch::Touches;
+use bevy::window::PrimaryWindow;
 
 #[derive(Component)]
 pub struct MainCamera;
 
-/// Orbit state. Fields prefixed `t_` are targets; the rest are smoothed.
+/// Map camera state. Fields prefixed `t_` are targets; the rest are smoothed.
 #[derive(Resource, Debug, Clone)]
 pub struct OrbitCam {
     pub focus: Vec3,
@@ -20,42 +29,62 @@ pub struct OrbitCam {
     pub dist: f32,
     pub t_focus: Vec3,
     pub t_yaw: f32,
-    pub t_pitch: f32,
+    /// The user's tilt on top of the automatic, zoom-driven one.
+    pub tilt: f32,
     pub t_dist: f32,
+    /// Closest the eye may come (smaller inside a process).
+    pub min_dist: f32,
     /// Seconds since the last user input; drives the idle drift.
     pub idle: f32,
     /// Set once the camera has been framed on the first layout.
     pub framed: bool,
+    /// Set by any user movement this frame (cancels follow).
+    pub moved: bool,
+    /// Extra tilt that lifts the view over towers blocking it (smoothed).
+    pub lift: f32,
 }
 
 impl Default for OrbitCam {
     fn default() -> Self {
         Self {
             focus: Vec3::ZERO,
-            yaw: 0.0,
-            pitch: 0.42,
+            yaw: -0.6,
+            pitch: 1.0,
             dist: 80.0,
             t_focus: Vec3::ZERO,
-            t_yaw: 0.0,
-            t_pitch: 0.42,
+            t_yaw: -0.6,
+            tilt: 0.0,
             t_dist: 80.0,
+            min_dist: 1.2,
             idle: 0.0,
             framed: false,
+            moved: false,
+            lift: 0.0,
         }
     }
 }
 
+/// The automatic tilt: a steep map far out, a low look close in.
+fn auto_pitch(dist: f32) -> f32 {
+    let x = ((dist.max(0.01).ln() - 1.0) / 3.2).clamp(0.0, 1.0);
+    0.16 + x * x * (3.0 - 2.0 * x) * 0.62
+}
+
 impl OrbitCam {
-    /// Frame the whole scene: a low, diagonal look across the city at the
-    /// Wall, like standing on the floor of the Blackwall's chamber.
+    /// The whole machine, as a map.
     pub fn frame_all(&mut self, extent: f32) {
-        self.t_focus = Vec3::new(0.0, 1.5, -extent * 0.35);
-        self.t_dist = extent * 1.9 + 10.0;
-        self.t_pitch = 0.3;
-        self.t_yaw = -0.55;
+        self.t_focus = Vec3::ZERO;
+        self.t_dist = extent * 2.7 + 6.0;
+        self.tilt = 0.0;
     }
 
-    fn eye(&self) -> Vec3 {
+    /// Frame a box: focus on its center, far enough to see all of it.
+    pub fn frame(&mut self, center: Vec3, size: f32) {
+        self.t_focus = center;
+        self.t_dist = (size * 1.9 + 1.5).max(self.min_dist * 1.5);
+    }
+
+    pub fn eye(&self) -> Vec3 {
         self.focus
             + self.dist
                 * Vec3::new(
@@ -64,14 +93,28 @@ impl OrbitCam {
                     self.pitch.cos() * self.yaw.cos(),
                 )
     }
+
+    fn pan(&mut self, d: Vec2) {
+        // Screen drag moves the ground under the cursor: right and forward
+        // on the floor plane, scaled by the distance.
+        let right = Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin());
+        let fwd = Vec3::new(-self.yaw.sin(), 0.0, -self.yaw.cos());
+        let k = self.dist * 0.0018;
+        self.t_focus += (-right * d.x + fwd * d.y) * k;
+        self.moved = true;
+    }
 }
 
-/// Length of the jack-in sequence (design system: `jack-in`).
-pub const JACK_IN_SECS: f32 = 3.2;
+/// Fog range from the eye: close in, the crowd sinks into black just past
+/// what you are looking at; far out, the whole map stays visible.
+pub fn fog(cam: &OrbitCam) -> (f32, f32) {
+    (cam.dist * 0.9 + 2.0, cam.dist * 2.2 + 12.0)
+}
 
-/// The entry sequence: falling through the Wall's rain into the chamber.
-/// 0–1.2s the camera drops through racing rain close to the Wall; then it
-/// pulls back to the overview while the city resolves out of black.
+/// Length of the arrival sequence.
+pub const JACK_IN_SECS: f32 = 2.6;
+
+/// Arrival: dropping from high above onto the map while the city rises.
 #[derive(Resource, Debug, Clone)]
 pub struct JackIn {
     /// Off with `--no-intro` or reduced motion.
@@ -79,8 +122,6 @@ pub struct JackIn {
     /// Seconds since it started; `None` until the first data arrives.
     pub elapsed: Option<f32>,
     pub done: bool,
-    start: (Vec3, f32, f32, f32),
-    end: (Vec3, f32, f32, f32),
 }
 
 impl Default for JackIn {
@@ -89,8 +130,6 @@ impl Default for JackIn {
             enabled: true,
             elapsed: None,
             done: false,
-            start: (Vec3::ZERO, 0.0, 0.0, 1.0),
-            end: (Vec3::ZERO, 0.0, 0.0, 1.0),
         }
     }
 }
@@ -107,17 +146,17 @@ impl JackIn {
         self.elapsed.is_some() && !self.done
     }
 
-    /// How much faster the rain falls: you are falling through it.
+    /// How much faster the Wall's rain falls during arrival.
     pub fn rain_boost(&self) -> f32 {
         match self.elapsed {
-            Some(t) if !self.done => 1.0 + 7.0 * (1.0 - smooth(0.0, 1.8, t)),
+            Some(t) if !self.done => 1.0 + 5.0 * (1.0 - smooth(0.0, 1.8, t)),
             _ => 1.0,
         }
     }
 
     /// Delay before the city starts rising, read when the first data arrives.
     pub fn city_delay(&self) -> f32 {
-        if self.enabled && !self.done { 1.2 } else { 0.0 }
+        if self.enabled && !self.done { 0.6 } else { 0.0 }
     }
 }
 
@@ -140,7 +179,7 @@ pub(crate) fn plugin(app: &mut App) {
         .add_systems(Startup, spawn_camera)
         .add_systems(
             Update,
-            (mouse_touch_input, keyboard_input, follow_and_apply)
+            (pointer_input, keyboard_input, apply)
                 .chain()
                 .after(SceneSet::Layout)
                 .before(SceneSet::Visuals),
@@ -152,135 +191,163 @@ fn spawn_camera(mut commands: Commands) {
         MainCamera,
         Camera3d::default(),
         Camera {
-            clear_color: ClearColorConfig::Custom(Color::srgb(0.004, 0.003, 0.012)),
+            clear_color: ClearColorConfig::Custom(Color::BLACK),
             ..default()
         },
         Projection::Perspective(PerspectiveProjection {
             fov: 0.75,
+            near: 0.005,
             far: 2000.0,
             ..default()
         }),
         Tonemapping::TonyMcMapface,
         DebandDither::Enabled,
-        Transform::from_xyz(0.0, 30.0, 80.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 60.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 }
 
-fn mouse_touch_input(
+/// Whether the segment from `o` along unit `d` for `len` crosses the box.
+fn segment_hits(o: Vec3, d: Vec3, len: f32, min: Vec3, max: Vec3) -> bool {
+    let inv = d.recip();
+    let t1 = (min - o) * inv;
+    let t2 = (max - o) * inv;
+    let tmin = t1.min(t2).max_element();
+    let tmax = t1.max(t2).min_element();
+    tmax >= tmin.max(0.0) && tmin < len
+}
+
+/// Where the ray under the cursor meets the horizontal plane at `y`.
+fn ground_hit(cam: &Camera, tf: &GlobalTransform, screen: Vec2, y: f32) -> Option<Vec3> {
+    let ray = cam.viewport_to_world(tf, screen).ok()?;
+    let d = *ray.direction;
+    if d.y.abs() < 1e-4 {
+        return None;
+    }
+    let t = (y - ray.origin.y) / d.y;
+    (t > 0.0).then(|| ray.origin + d * t)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pointer_input(
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     touches: Res<Touches>,
     block: Res<InputBlock>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     mut cam: ResMut<OrbitCam>,
-    mut sel: ResMut<Selection>,
     mut pinch_prev: Local<Option<f32>>,
 ) {
+    cam.moved = false;
     if block.pointer {
         *pinch_prev = None;
         return;
     }
     let d = motion.delta;
-    let mut active = false;
-    if buttons.pressed(MouseButton::Left) && d != Vec2::ZERO {
+    if (buttons.pressed(MouseButton::Left) || buttons.pressed(MouseButton::Middle))
+        && d.length() > 0.0
+    {
+        cam.pan(d);
+    }
+    if buttons.pressed(MouseButton::Right) && d != Vec2::ZERO {
         cam.t_yaw -= d.x * 0.005;
-        cam.t_pitch = (cam.t_pitch + d.y * 0.004).clamp(-1.2, 1.45);
-        active = true;
+        cam.tilt = (cam.tilt + d.y * 0.003).clamp(-0.5, 0.6);
+        cam.moved = true;
     }
     if scroll.delta.y != 0.0 {
         let step = match scroll.unit {
-            MouseScrollUnit::Line => scroll.delta.y * 0.12,
-            MouseScrollUnit::Pixel => scroll.delta.y * 0.002,
+            MouseScrollUnit::Line => scroll.delta.y * 0.14,
+            MouseScrollUnit::Pixel => scroll.delta.y * 0.0025,
+        }
+        .clamp(-0.6, 0.6);
+        let f = 1.0 - step;
+        let cursor = window.single().ok().and_then(|w| w.cursor_position());
+        let hit = match (cursor, camera.single()) {
+            (Some(c), Ok((camera, tf))) => ground_hit(camera, tf, c, cam.t_focus.y),
+            _ => None,
         };
-        cam.t_dist = (cam.t_dist * (1.0 - step)).clamp(2.0, 2000.0);
-        active = true;
+        zoom(&mut cam, f, hit);
     }
 
-    // Touch: one finger orbits, two fingers pinch-zoom and pan (PLAN §10).
+    // Touch: one finger pans, two fingers pinch to zoom.
     let ts: Vec<_> = touches.iter().collect();
     match ts.as_slice() {
         [t] => {
-            let d = t.delta();
-            cam.t_yaw -= d.x * 0.006;
-            cam.t_pitch = (cam.t_pitch + d.y * 0.005).clamp(-1.2, 1.45);
+            if t.delta() != Vec2::ZERO {
+                cam.pan(t.delta());
+            }
             *pinch_prev = None;
-            active |= d != Vec2::ZERO;
         }
         [a, b, ..] => {
             let dist = a.position().distance(b.position());
             if let Some(prev) = *pinch_prev
                 && prev > 1.0
             {
-                cam.t_dist = (cam.t_dist * prev / dist.max(1.0)).clamp(2.0, 2000.0);
+                zoom(&mut cam, prev / dist.max(1.0), None);
             }
             *pinch_prev = Some(dist);
-            let avg = (a.delta() + b.delta()) * 0.5;
-            if avg.length() > 0.5 {
-                pan(&mut cam, avg);
-                sel.follow = false;
-            }
-            active = true;
         }
         [] => *pinch_prev = None,
     }
-    if active {
-        cam.idle = 0.0;
-    }
 }
 
-fn pan(cam: &mut OrbitCam, d: Vec2) {
-    let right = Vec3::new(cam.yaw.cos(), 0.0, -cam.yaw.sin());
-    let up = Vec3::Y;
-    let k = cam.dist * 0.0016;
-    cam.t_focus += (-right * d.x + up * d.y) * k;
+/// Zoom by factor `f` (< 1 zooms in), toward `toward` if given.
+fn zoom(cam: &mut OrbitCam, f: f32, toward: Option<Vec3>) {
+    let before = cam.t_dist;
+    cam.t_dist = (cam.t_dist * f).clamp(cam.min_dist, 600.0);
+    let real = cam.t_dist / before;
+    if let Some(p) = toward
+        && real < 1.0
+    {
+        cam.t_focus += (p - cam.t_focus) * (1.0 - real);
+    }
+    cam.moved = true;
 }
 
 fn keyboard_input(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     block: Res<InputBlock>,
+    ex: Res<crate::explore::Explore>,
     mut cam: ResMut<OrbitCam>,
 ) {
     if block.keyboard {
         return;
     }
     let dt = time.delta_secs();
-    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let active = keys.get_just_pressed().next().is_some();
-
-    // Shift + arrows orbit (plain arrows walk the process tree, see nav.rs).
-    if shift {
-        let mut o = Vec2::ZERO;
-        if keys.pressed(KeyCode::ArrowLeft) {
-            o.x += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowRight) {
-            o.x -= 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowUp) {
-            o.y += 1.0;
-        }
-        if keys.pressed(KeyCode::ArrowDown) {
-            o.y -= 1.0;
-        }
-        cam.t_yaw += o.x * dt * 1.2;
-        cam.t_pitch = (cam.t_pitch + o.y * dt * 0.9).clamp(-1.2, 1.45);
+    let held = |k: &[KeyCode]| keys.any_pressed(k.iter().copied()) as i32 as f32;
+    // Inside a tower the arrows walk its elements; WASD still pans.
+    let arrows = ex.inside().is_none();
+    let (r, l, u, d) = if arrows {
+        (
+            KeyCode::ArrowRight,
+            KeyCode::ArrowLeft,
+            KeyCode::ArrowUp,
+            KeyCode::ArrowDown,
+        )
+    } else {
+        (KeyCode::KeyD, KeyCode::KeyA, KeyCode::KeyW, KeyCode::KeyS)
+    };
+    let x = held(&[KeyCode::KeyD, r]) - held(&[KeyCode::KeyA, l]);
+    let y = held(&[KeyCode::KeyW, u]) - held(&[KeyCode::KeyS, d]);
+    if x != 0.0 || y != 0.0 {
+        cam.pan(Vec2::new(x, -y) * dt * 500.0);
     }
-    let zoom = keys.pressed(KeyCode::PageUp) as i32 - keys.pressed(KeyCode::PageDown) as i32
-        + keys.pressed(KeyCode::Equal) as i32
-        - keys.pressed(KeyCode::Minus) as i32
-        + keys.pressed(KeyCode::NumpadAdd) as i32
-        - keys.pressed(KeyCode::NumpadSubtract) as i32;
-    if zoom != 0 {
-        cam.t_dist = (cam.t_dist * (1.0 - zoom as f32 * dt * 1.5)).clamp(2.0, 2000.0);
+    let turn = held(&[KeyCode::KeyE]) - held(&[KeyCode::KeyQ]);
+    if turn != 0.0 {
+        cam.t_yaw += turn * dt * 1.4;
+        cam.moved = true;
     }
-    if active {
-        cam.idle = 0.0;
+    let z = held(&[KeyCode::Equal, KeyCode::NumpadAdd, KeyCode::PageUp])
+        - held(&[KeyCode::Minus, KeyCode::NumpadSubtract, KeyCode::PageDown]);
+    if z != 0.0 {
+        zoom(&mut cam, 1.0 - z * dt * 1.6, None);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn follow_and_apply(
+fn apply(
     time: Res<Time>,
     m: Res<Machine>,
     sl: Res<SceneLayout>,
@@ -289,7 +356,8 @@ fn follow_and_apply(
     mut jack: ResMut<JackIn>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
-    touches: Res<Touches>,
+    ex: Res<crate::explore::Explore>,
+    sel: Res<Selection>,
     mut tf: Query<&mut Transform, With<MainCamera>>,
 ) {
     let dt = time.delta_secs();
@@ -297,61 +365,83 @@ fn follow_and_apply(
         cam.framed = true;
         cam.frame_all(sl.layout.extent);
         if jack.enabled && !settings.reduced_motion {
-            // Start inside the rain, a few units in front of the Wall.
-            jack.start = (Vec3::new(0.0, 18.0, sl.layout.wall_z()), 0.0, 0.05, 13.0);
-            jack.end = (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist);
+            // Arrive from high above, turned a little away.
+            cam.focus = Vec3::ZERO;
+            cam.dist = cam.t_dist * 3.0;
+            cam.yaw = cam.t_yaw - 0.9;
             jack.elapsed = Some(0.0);
         } else {
             jack.done = true;
-            let (f, d) = (cam.t_focus, cam.t_dist);
-            cam.focus = f;
-            cam.dist = d;
+            cam.focus = cam.t_focus;
+            cam.dist = cam.t_dist;
             cam.yaw = cam.t_yaw;
-            cam.pitch = cam.t_pitch;
         }
     }
     if jack.running() {
-        let skip = keys.get_just_pressed().next().is_some()
-            || buttons.get_just_pressed().next().is_some()
-            || touches.iter_just_pressed().next().is_some();
         let e = jack.elapsed.unwrap_or(0.0) + dt;
         jack.elapsed = Some(e);
-        let (sf, sy, sp, sd) = jack.start;
-        let (ef, ey, ep, ed) = jack.end;
-        if skip || e >= JACK_IN_SECS {
+        if e >= JACK_IN_SECS
+            || keys.get_just_pressed().next().is_some()
+            || buttons.get_just_pressed().next().is_some()
+        {
             jack.done = true;
-            (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist) = (ef, ey, ep, ed);
-        } else {
-            // Fall: drop through the rain, then pull back as the city forms.
-            let fall = smooth(0.0, 1.4, e);
-            let pull = smooth(1.0, 3.0, e);
-            let falling = sf - Vec3::Y * 7.0 * fall;
-            cam.focus = falling.lerp(ef, pull);
-            cam.yaw = sy + (ey - sy) * pull;
-            cam.pitch = sp + (ep - sp) * pull;
-            cam.dist = sd + (ed - sd) * pull * pull;
-            (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist) =
-                (cam.focus, cam.yaw, cam.pitch, cam.dist);
-            if let Ok(mut t) = tf.single_mut() {
-                *t = Transform::from_translation(cam.eye()).looking_at(cam.focus, Vec3::Y);
-            }
-            return;
         }
     }
-    cam.idle += dt;
-    // Idle drift: a slow orbit when nobody has touched anything for a while.
-    if cam.idle > 45.0 && !settings.reduced_motion {
-        cam.t_yaw += dt * 0.03;
+    if cam.moved {
+        cam.idle = 0.0;
+    } else {
+        cam.idle += dt;
     }
-    let k = 1.0 - (-dt * 5.0).exp();
+    // Idle drift: a slow turn when nobody has touched anything for a while.
+    if cam.idle > 45.0 && !settings.reduced_motion {
+        cam.t_yaw += dt * 0.02;
+    }
+    // Keep the eye over the map.
+    let lim = sl.layout.extent.max(4.0) + 6.0;
+    cam.t_focus.x = cam.t_focus.x.clamp(-lim, lim);
+    cam.t_focus.z = cam.t_focus.z.clamp(-lim, lim + 4.0);
+    cam.t_dist = cam.t_dist.max(cam.min_dist);
+
+    let speed = if jack.running() { 1.6 } else { 6.0 };
+    let k = 1.0 - (-dt * speed).exp();
     cam.focus = cam.focus.lerp(cam.t_focus, k);
     cam.yaw += (cam.t_yaw - cam.yaw) * k;
-    cam.pitch += (cam.t_pitch - cam.pitch) * k;
-    cam.dist += (cam.t_dist - cam.dist) * (1.0 - (-dt * 3.0).exp());
+    // Zoom eases in log space, so diving 100× feels as smooth as 2×.
+    let kd = 1.0 - (-dt * speed * 0.7).exp();
+    cam.dist = (cam.dist.ln() + (cam.t_dist.ln() - cam.dist.ln()) * kd).exp();
+    // Keep the view clear: if a tower stands between the eye and the focus,
+    // tilt up until it doesn't (in steps), then ease toward that tilt.
+    let base = (auto_pitch(cam.dist) + cam.tilt).clamp(0.05, 1.45);
+    let open = ex.inside();
+    let chosen = sel.key;
+    let blocked = |pitch: f32| {
+        let mut probe = cam.clone();
+        probe.pitch = pitch;
+        let eye = probe.eye();
+        let dir = cam.focus - eye;
+        let len = dir.length();
+        sl.layout.columns.iter().any(|c| {
+            Some(c.key) != open
+                && Some(c.key) != chosen
+                && segment_hits(
+                    eye,
+                    dir / len.max(1e-6),
+                    len * 0.97,
+                    Vec3::new(c.min.x, 0.0, c.min.y),
+                    Vec3::new(c.max.x, c.height(), c.max.y),
+                )
+        })
+    };
+    // With something chosen the cutaway shows it instead (towers.wgsl).
+    let mut need = 0.0;
+    while chosen.is_none() && need < 1.2 && blocked(base + need) {
+        need += 0.1;
+    }
+    cam.lift += (need - cam.lift) * (1.0 - (-dt * 3.0).exp());
+    cam.pitch = (base + cam.lift).clamp(0.05, 1.5);
     if let Ok(mut t) = tf.single_mut() {
-        // Never below the floor: looking up at a tower stands you on it.
         let mut eye = cam.eye();
-        eye.y = eye.y.max(0.25);
+        eye.y = eye.y.max(cam.min_dist * 0.1);
         *t = Transform::from_translation(eye).looking_at(cam.focus, Vec3::Y);
     }
 }

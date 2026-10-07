@@ -1,8 +1,13 @@
-//! Picking columns with the mouse or a tap: a ray against each column's box.
-//! Cheaper than triangle picking on the dot mesh, and it works identically
-//! on every backend.
+//! Picking with the mouse or a tap: a ray against each tower's box (and,
+//! inside an open tower, against its interior elements first). Cheaper than
+//! triangle picking, and identical on every backend.
+//!
+//! Click a tower to choose it; click the chosen tower again to open it.
+//! Inside, click an element to go to it. A press that drags pans instead.
 
 use crate::camera::{InputBlock, MainCamera};
+use crate::explore::Explore;
+use crate::interior::ElementKind;
 use crate::*;
 use bevy::input::touch::Touches;
 use bevy::window::PrimaryWindow;
@@ -24,6 +29,12 @@ fn ray_box(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (tmax >= tmin.max(0.0)).then_some(tmin.max(0.0))
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    Tower(ProcKey),
+    Element(usize),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pick(
     window: Query<&Window, With<PrimaryWindow>>,
@@ -34,131 +45,93 @@ fn pick(
     sl: Res<SceneLayout>,
     settings: Res<SceneSettings>,
     mut sel: ResMut<Selection>,
-    mut ex: ResMut<crate::explore::Explore>,
+    mut ex: ResMut<Explore>,
     mut press: Local<Option<Vec2>>,
 ) {
     let (Ok(window), Ok((cam, cam_tf))) = (window.single(), camera.single()) else {
         return;
     };
-    if ex.inside().is_some() {
-        pick_inside(
-            window, cam, cam_tf, &buttons, &touches, &block, &mut ex, &mut sel, &mut press,
-        );
-        return;
-    }
-    let hit_at = |screen: Vec2| -> Option<ProcKey> {
+    let hit_at = |screen: Vec2, ex: &Explore| -> Option<Hit> {
         let ray = cam.viewport_to_world(cam_tf, screen).ok()?;
         let dir: Vec3 = *ray.direction;
+        if ex.inside().is_some() {
+            let local = ex.to_local(ray.origin);
+            if let Some(i) = crate::interior::pick(&ex.interior, local, dir) {
+                return Some(Hit::Element(i));
+            }
+        }
         sl.layout
             .columns
             .iter()
             .filter(|c| settings.show_kernel || c.realm == bw_model::Realm::User)
+            // The open tower is an outline: look through it.
+            .filter(|c| ex.inside() != Some(c.key))
             .filter_map(|c| {
-                let h = c.half() + Vec2::splat(0.08);
                 ray_box(
                     ray.origin,
                     dir,
-                    c.base - Vec3::new(h.x, 0.0, h.y),
-                    c.top() + Vec3::new(h.x, 0.1, h.y),
+                    Vec3::new(c.min.x, 0.0, c.min.y),
+                    Vec3::new(c.max.x, c.height(), c.max.y),
                 )
                 .map(|t| (t, c.key))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, k)| k)
+            .map(|(_, k)| Hit::Tower(k))
     };
-
-    // Taps select (a short touch that didn't drag).
-    for t in touches.iter_just_released() {
-        if !block.pointer
-            && t.start_position().distance(t.position()) < 12.0
-            && let Some(k) = hit_at(t.position())
-        {
+    let activate = |h: Hit, ex: &mut Explore, sel: &mut Selection| match h {
+        Hit::Tower(k) if sel.key == Some(k) && ex.inside().is_none() => ex.dive(k),
+        Hit::Tower(k) => {
             sel.key = Some(k);
             sel.follow = true;
         }
-    }
-
-    let Some(cursor) = window.cursor_position() else {
-        sel.hovered = None;
-        return;
-    };
-    if block.pointer {
-        sel.hovered = None;
-        *press = None;
-        return;
-    }
-    let hovered = hit_at(cursor);
-    if sel.hovered != hovered {
-        sel.hovered = hovered;
-    }
-    if buttons.just_pressed(MouseButton::Left) {
-        *press = Some(cursor);
-    }
-    // A click is a press and release without dragging (dragging orbits).
-    if buttons.just_released(MouseButton::Left) {
-        if press.is_some_and(|p| p.distance(cursor) < 5.0)
-            && let Some(k) = hovered
-        {
-            sel.key = Some(k);
-            sel.follow = true;
+        Hit::Element(i) => {
+            // A child's link inside: go to that child's tower.
+            if let ElementKind::Satellite { child } = ex.interior.elements[i].kind {
+                sel.key = Some(child);
+                sel.follow = true;
+            } else {
+                ex.choose(Some(i));
+            }
         }
-        *press = None;
-    }
-}
+    };
 
-/// Picking inside a process: the interior's elements.
-#[allow(clippy::too_many_arguments)]
-fn pick_inside(
-    window: &Window,
-    cam: &Camera,
-    cam_tf: &GlobalTransform,
-    buttons: &ButtonInput<MouseButton>,
-    touches: &Touches,
-    block: &InputBlock,
-    ex: &mut crate::explore::Explore,
-    sel: &mut Selection,
-    press: &mut Option<Vec2>,
-) {
-    let hit = |screen: Vec2, ex: &crate::explore::Explore| {
-        let ray = cam.viewport_to_world(cam_tf, screen).ok()?;
-        crate::interior::pick(&ex.interior, ray.origin, *ray.direction)
-    };
-    let activate = |i: usize, ex: &mut crate::explore::Explore, sel: &mut Selection| {
-        // Choosing a satellite that is already chosen dives into that child.
-        if ex.element == Some(i)
-            && let crate::interior::ElementKind::Satellite { child } = ex.interior.elements[i].kind
-        {
-            sel.key = Some(child);
-            ex.dive(child);
-            return;
-        }
-        ex.choose(Some(i));
-    };
+    // Taps choose (a short touch that didn't drag).
     for t in touches.iter_just_released() {
         if !block.pointer
             && t.start_position().distance(t.position()) < 12.0
-            && let Some(i) = hit(t.position(), ex)
+            && let Some(h) = hit_at(t.position(), &ex)
         {
-            activate(i, ex, sel);
+            activate(h, &mut ex, &mut sel);
         }
     }
+
     let Some(cursor) = window.cursor_position().filter(|_| !block.pointer) else {
+        sel.hovered = None;
         ex.hovered = None;
         *press = None;
         return;
     };
-    let hovered = hit(cursor, ex);
-    if ex.hovered != hovered {
-        ex.hovered = hovered;
+    let hovered = hit_at(cursor, &ex);
+    let (ht, he) = match hovered {
+        Some(Hit::Tower(k)) => (Some(k), None),
+        Some(Hit::Element(i)) => (None, Some(i)),
+        None => (None, None),
+    };
+    if sel.hovered != ht {
+        sel.hovered = ht;
+    }
+    if ex.hovered != he {
+        ex.hovered = he;
     }
     if buttons.just_pressed(MouseButton::Left) {
         *press = Some(cursor);
     }
+    // A click is a press and release without dragging (dragging pans).
     if buttons.just_released(MouseButton::Left) {
         if press.is_some_and(|p| p.distance(cursor) < 5.0)
-            && let Some(i) = hovered
+            && let Some(h) = hovered
         {
-            activate(i, ex, sel);
+            activate(h, &mut ex, &mut sel);
         }
         *press = None;
     }

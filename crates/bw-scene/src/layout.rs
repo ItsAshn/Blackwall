@@ -1,24 +1,32 @@
-//! The city layout: Deep Space as a grid of dot columns.
+//! The map: one grid, and the grid is RAM.
 //!
-//! Every process is a column standing on a dot-lattice floor. Each process
-//! *tree* is a district (a block of columns in depth-first order, so families
-//! stand together), districts are separated by streets, and the Blackwall
-//! rises behind the city. Kernel threads stand in their own districts on the
-//! far side of the Wall, grouped by subsystem.
+//! The ground is the machine's memory: a square whose area is total RAM.
+//! Every process, kernel or user, owns a plot whose area is its share of
+//! the memory in use; the kernel's own memory (caches, slabs) is a plot of
+//! its own, and free memory is open, empty ground. Plots are cut by an
+//! ordered binary treemap, families staying together and groups in a stable
+//! but unsorted order, so the map reads like a city grown over time rather
+//! than a table.
+//!
+//! On each plot stands a tower: its height is what the process is doing
+//! (recent CPU, plus a little for its memory), so the skyline is the
+//! system's activity at a glance.
 //!
 //! Pure functions over the model (no Bevy systems), so the layout is
 //! unit-testable and identical on every platform.
 
 use bevy::math::{Vec2, Vec3};
-use bw_model::{ProcKey, Process, Realm, Snapshot};
-use std::collections::{BTreeMap, HashMap};
+use bw_model::{ProcKey, Realm, Snapshot};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// Distance between neighbouring column slots.
-pub const CELL: f32 = 1.0;
-/// Vertical distance between dots in a column.
+/// Vertical pitch of interior rows (process interiors).
 pub const LEVEL_H: f32 = 0.2;
-/// Empty cells between districts.
-const STREET: i32 = 1;
+/// Gap left round each group of plots (a family, the kernel).
+const STREET: f32 = 0.22;
+/// Gap left round each plot inside a group: crowded, but not touching.
+const ALLEY: f32 = 0.05;
+/// The smallest plot side, so even an idle helper can be clicked.
+const MIN_PLOT_MB: f32 = 2.0;
 
 /// Kernel subsystems, each a district behind the Wall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -105,119 +113,165 @@ impl Subsystem {
     }
 }
 
-/// Dots stacked in a column: more memory, more dots (logarithmic).
-pub fn levels(p: &Process) -> u32 {
-    if p.realm == Realm::Kernel {
-        return 4;
-    }
-    // Monoliths: twice the dots of before, so a big process towers over you.
-    let mb = p.mem_bytes as f32 / 1_048_576.0;
-    (4.0 + 10.0 * (1.0 + mb).log10()).round().clamp(4.0, 48.0) as u32
+/// Tower height for a plot of side `side`: an idle process is a squat block
+/// as tall as half its width, a busy one a tower several times its width.
+/// Proportions, not absolute height, carry the activity, so big and small
+/// processes read the same way.
+pub fn height(side: f32, cpu_avg: f32) -> f32 {
+    let cpu = (cpu_avg / 100.0).clamp(0.0, 1.5);
+    side * (0.45 + 3.2 * cpu.sqrt()) + 0.1
 }
 
-/// Horizontal distance between a tower's windows.
-pub const WINDOW: f32 = 0.2;
-
-/// Resident memory at each ledge: a tower steps in at 10 MB, 100 MB, 1 GB
-/// and 10 GB, so the ledges are a scale you can count from afar.
-pub const LEDGE_MB: [f32; 4] = [10.0, 100.0, 1000.0, 10_000.0];
-
-fn level_of(mb: f32) -> f32 {
-    4.0 + 10.0 * (1.0 + mb).log10()
+/// What a non-process plot holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    /// Free memory: open, empty ground.
+    Free,
+    /// Memory the kernel holds itself (caches, slabs, page tables).
+    KernelMemory,
 }
 
-/// Levels at which a tower of `levels` has its ledges (bottom first).
-pub fn ledges(levels: u32) -> impl Iterator<Item = u32> {
-    LEDGE_MB
-        .iter()
-        .map(|mb| level_of(*mb).round() as u32)
-        .filter(move |l| *l < levels)
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub kind: BlockKind,
+    pub min: Vec2,
+    pub max: Vec2,
+    pub bytes: u64,
 }
 
-/// Windows along x and z: wider with more threads, deeper with more memory.
-/// The widest tower is four windows, so neighbours never touch but crowd.
-pub fn footprint(p: &Process) -> (u32, u32) {
-    if p.realm == Realm::Kernel {
-        return (1, 1);
-    }
-    let wx = match p.threads.unwrap_or(1) {
-        0..=2 => 2,
-        3..=12 => 3,
-        _ => 4,
-    };
-    let wz = match p.mem_bytes {
-        m if m >= 512 << 20 => 4,
-        m if m >= 64 << 20 => 3,
-        _ => 2,
-    };
-    (wx, wz)
-}
-
-/// One process tower.
+/// One process tower on its plot.
 #[derive(Clone, Debug)]
 pub struct Column {
     pub key: ProcKey,
-    /// Center of the tower's base, on the floor.
-    pub base: Vec3,
-    /// Windows along x and z at the base.
-    pub wx: u32,
-    pub wz: u32,
-    pub levels: u32,
+    /// The tower's footprint on the floor (x, z).
+    pub min: Vec2,
+    pub max: Vec2,
+    pub tall: f32,
     pub realm: Realm,
 }
 
 impl Column {
-    pub fn for_process(p: &Process, base: Vec3) -> Column {
-        let (wx, wz) = footprint(p);
-        Column {
-            key: p.key,
-            base,
-            wx,
-            wz,
-            levels: levels(p),
-            realm: p.realm,
-        }
+    pub fn height(&self) -> f32 {
+        self.tall
     }
 
-    pub fn height(&self) -> f32 {
-        self.levels as f32 * LEVEL_H
+    /// Center of the footprint, on the floor.
+    pub fn base(&self) -> Vec3 {
+        let c = (self.min + self.max) * 0.5;
+        Vec3::new(c.x, 0.0, c.y)
     }
 
     pub fn top(&self) -> Vec3 {
-        self.base + Vec3::Y * self.height()
+        self.base() + Vec3::Y * self.tall
     }
 
-    /// Half of the base's width (x) and depth (z).
+    pub fn center(&self) -> Vec3 {
+        self.base() + Vec3::Y * self.tall * 0.5
+    }
+
+    /// Half of the footprint's width (x) and depth (z).
     pub fn half(&self) -> Vec2 {
-        Vec2::new(self.wx as f32, self.wz as f32) * WINDOW * 0.5
+        (self.max - self.min) * 0.5
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Layout {
     pub columns: Vec<Column>,
+    pub blocks: Vec<Block>,
     index: HashMap<ProcKey, usize>,
-    kernel_sub: HashMap<ProcKey, Subsystem>,
-    districts: HashMap<Subsystem, Vec2>,
-    /// User-city bounds on the floor (x, z).
+    /// The RAM square on the floor (x, z).
     pub min: Vec2,
     pub max: Vec2,
-    /// Rough radius of the city, for camera framing.
+    /// Half the RAM square's side, for camera framing.
     pub extent: f32,
 }
 
+/// Something to place: a process or a block, with its weight in MB.
+#[derive(Clone, Copy, Debug)]
+enum Item {
+    Proc(ProcKey),
+    Block(BlockKind),
+}
+
+/// Ordered binary treemap: split the list where the weight halves, cut the
+/// rectangle across its longer side in proportion, recurse. Keeps the given
+/// order (so families stay together) and gives reasonable aspect ratios.
+fn treemap<T: Copy>(items: &[(T, f32)], min: Vec2, max: Vec2, out: &mut Vec<(T, Vec2, Vec2)>) {
+    match items {
+        [] => {}
+        [(t, _)] => out.push((*t, min, max)),
+        _ => {
+            let total: f32 = items.iter().map(|i| i.1).sum::<f32>().max(1e-6);
+            let mut acc = 0.0;
+            let mut k = 1;
+            let mut best = f32::MAX;
+            for (i, it) in items.iter().enumerate().take(items.len() - 1) {
+                acc += it.1;
+                let d = (acc - total / 2.0).abs();
+                if d < best {
+                    best = d;
+                    k = i + 1;
+                }
+            }
+            let f = items[..k].iter().map(|i| i.1).sum::<f32>() / total;
+            let size = max - min;
+            if size.x >= size.y {
+                let x = min.x + size.x * f;
+                treemap(&items[..k], min, Vec2::new(x, max.y), out);
+                treemap(&items[k..], Vec2::new(x, min.y), max, out);
+            } else {
+                let y = min.y + size.y * f;
+                treemap(&items[..k], min, Vec2::new(max.x, y), out);
+                treemap(&items[k..], Vec2::new(min.x, y), max, out);
+            }
+        }
+    }
+}
+
+/// Shrink a rectangle by `d` on every side, never below a sliver.
+fn inset(min: Vec2, max: Vec2, d: f32) -> (Vec2, Vec2) {
+    let size = max - min;
+    let d = d.min(size.x * 0.3).min(size.y * 0.3);
+    (min + Vec2::splat(d), max - Vec2::splat(d))
+}
+
+/// A stable hash, so group order is fixed but not sorted.
+fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 impl Layout {
-    pub fn build(s: &Snapshot) -> Layout {
-        let user = |k: &ProcKey| s.processes.get(k).is_some_and(|p| p.realm == Realm::User);
+    /// Lay out the map. `cpu` holds recent CPU samples per process; towers
+    /// are as tall as the average of the last few, so the skyline is calm.
+    pub fn build(s: &Snapshot, cpu: &HashMap<ProcKey, VecDeque<f32>>) -> Layout {
+        let mb = |b: u64| b as f32 / 1_048_576.0;
+        let total = mb(s.system.mem_total).max(256.0);
+        let used = mb(s.system.mem_used).clamp(0.0, total);
+
+        // Process trees: the dominant root's children each head a family,
+        // as does every other root; the kernel is one more group.
         let mut children: BTreeMap<ProcKey, Vec<ProcKey>> = BTreeMap::new();
         let mut roots = Vec::new();
-        for p in s.processes.values().filter(|p| p.realm == Realm::User) {
-            match p.parent.filter(|pp| user(pp)) {
+        let mut kernel = Vec::new();
+        for p in s.processes.values() {
+            if p.realm == Realm::Kernel {
+                kernel.push(p.key);
+                continue;
+            }
+            match p
+                .parent
+                .filter(|pp| s.processes.get(pp).is_some_and(|q| q.realm == Realm::User))
+            {
                 Some(pp) => children.entry(pp).or_default().push(p.key),
                 None => roots.push(p.key),
             }
         }
         roots.sort();
+        kernel.sort();
         for v in children.values_mut() {
             v.sort();
         }
@@ -232,162 +286,129 @@ impl Layout {
             }
             out
         };
-
-        // Districts: the dominant root (init / launchd) gets a one-column
-        // plaza, and each of its children's subtrees becomes a district, as
-        // does every other root (orphans are common on Windows).
-        let total: usize = roots.iter().map(|r| dfs(*r).len()).sum();
+        let count: usize = roots.iter().map(|r| dfs(*r).len()).sum();
         let center = roots
             .iter()
             .copied()
             .max_by_key(|r| dfs(*r).len())
-            .filter(|r| dfs(*r).len() * 10 >= total * 3);
-        let mut district_roots: Vec<ProcKey> = Vec::new();
+            .filter(|r| dfs(*r).len() * 10 >= count * 3);
+        let mut heads: Vec<ProcKey> = Vec::new();
         if let Some(c) = center {
-            district_roots.extend(children.get(&c).into_iter().flatten());
+            heads.extend(children.get(&c).into_iter().flatten());
         }
-        district_roots.extend(roots.iter().filter(|r| Some(**r) != center));
-        district_roots.sort();
+        heads.extend(roots.iter().filter(|r| Some(**r) != center));
 
-        let mut districts: Vec<Vec<ProcKey>> = Vec::new();
-        // Tiny trees share one "suburb" block so the city isn't mostly streets.
-        let mut suburb: Vec<ProcKey> = center.into_iter().collect();
-        for r in district_roots {
-            let d = dfs(r);
-            if d.len() <= 2 {
-                suburb.extend(d);
+        // Groups of items, each with a stable sort key.
+        let mut groups: Vec<(u64, Vec<Item>)> = Vec::new();
+        let mut loose: Vec<Item> = center.map(Item::Proc).into_iter().collect();
+        for h in heads {
+            let fam: Vec<Item> = dfs(h).into_iter().map(Item::Proc).collect();
+            if fam.len() <= 2 {
+                loose.extend(fam);
             } else {
-                districts.push(d);
+                groups.push((mix(h.pid as u64 ^ (h.start_time << 20)), fam));
             }
         }
-        if !suburb.is_empty() {
-            districts.insert(0, suburb);
+        if !loose.is_empty() {
+            groups.push((mix(1), loose));
         }
+        // Weights: processes by resident memory, scaled so that together with
+        // the kernel's own memory they fill exactly the memory in use.
+        let rss: f32 = s
+            .processes
+            .values()
+            .map(|p| mb(p.mem_bytes).max(MIN_PLOT_MB))
+            .sum();
+        let scale = if rss > used { used / rss } else { 1.0 };
+        let kernel_mem = (used - rss * scale).max(0.0);
+        let mut kitems: Vec<Item> = kernel.iter().copied().map(Item::Proc).collect();
+        // The kernel's own memory gets a plot when there is any to speak of.
+        if kernel_mem >= 16.0 {
+            kitems.push(Item::Block(BlockKind::KernelMemory));
+        }
+        if !kitems.is_empty() {
+            groups.push((mix(2), kitems));
+        }
+        groups.push((mix(3), vec![Item::Block(BlockKind::Free)]));
+        groups.sort_by_key(|g| g.0);
+        let free = (total - used).max(0.0);
+        let weight = |it: &Item| match it {
+            Item::Proc(k) => mb(s.processes[k].mem_bytes).max(MIN_PLOT_MB) * scale,
+            Item::Block(BlockKind::KernelMemory) => kernel_mem.max(MIN_PLOT_MB),
+            Item::Block(BlockKind::Free) => free.max(MIN_PLOT_MB),
+        };
 
-        // Each district is a grid with ~10% spare capacity, so a few
-        // processes coming and going don't reshape the whole city.
-        let dims: Vec<(i32, i32)> = districts
+        // The RAM square: 10 units a side per sqrt(GB).
+        let side = 10.0 * (total / 1024.0).sqrt().max(1.0);
+        let (min, max) = (Vec2::splat(-side / 2.0), Vec2::splat(side / 2.0));
+        let gw: Vec<(usize, f32)> = groups
             .iter()
-            .map(|d| {
-                let cap = (d.len() as f32 * 1.1).ceil() as i32 + 1;
-                let w = (cap as f32).sqrt().ceil() as i32;
-                (w, (cap + w - 1) / w)
-            })
+            .enumerate()
+            .map(|(i, g)| (i, g.1.iter().map(weight).sum()))
             .collect();
-        let area: i32 = dims.iter().map(|(w, h)| (w + STREET) * (h + STREET)).sum();
-        let row_w = ((area as f32 * 1.6).sqrt().ceil() as i32)
-            .max(dims.iter().map(|d| d.0).max().unwrap_or(1));
-
-        // Shelf packing, districts in stable (root key) order.
-        let mut origin = Vec::with_capacity(dims.len());
-        let (mut x, mut z, mut row_h) = (0, 0, 0);
-        for &(w, h) in &dims {
-            if x > 0 && x + w > row_w {
-                x = 0;
-                z += row_h + STREET;
-                row_h = 0;
-            }
-            origin.push((x, z));
-            x += w + STREET;
-            row_h = row_h.max(h);
-        }
-        let city_w = row_w as f32 * CELL;
-        let city_d = ((z + row_h) as f32 * CELL).max(CELL);
+        let mut grects = Vec::new();
+        treemap(&gw, min, max, &mut grects);
 
         let mut columns = Vec::new();
-        for (di, d) in districts.iter().enumerate() {
-            let (w, _) = dims[di];
-            let (ox, oz) = origin[di];
-            for (i, k) in d.iter().enumerate() {
-                let (row, col) = (i as i32 / w, i as i32 % w);
-                // Boustrophedon order keeps parents next to their children.
-                let col = if row % 2 == 0 { col } else { w - 1 - col };
-                let gx = (ox + col) as f32 * CELL - city_w / 2.0;
-                // Row 0 is nearest the Wall; the city extends toward the viewer.
-                let gz = (oz + row) as f32 * CELL - city_d / 2.0;
-                columns.push(Column::for_process(&s.processes[k], Vec3::new(gx, 0.0, gz)));
+        let mut blocks = Vec::new();
+        for (gi, gmin, gmax) in grects {
+            let items: Vec<(Item, f32)> = groups[gi].1.iter().map(|it| (*it, weight(it))).collect();
+            let (gmin, gmax) = inset(gmin, gmax, STREET);
+            let mut rects = Vec::new();
+            treemap(&items, gmin, gmax, &mut rects);
+            for (it, rmin, rmax) in rects {
+                match it {
+                    Item::Proc(k) => {
+                        let (a, b) = inset(rmin, rmax, ALLEY);
+                        let p = &s.processes[&k];
+                        let recent = cpu
+                            .get(&k)
+                            .filter(|h| !h.is_empty())
+                            .map(|h| {
+                                let n = h.len().min(6);
+                                h.iter().rev().take(n).sum::<f32>() / n as f32
+                            })
+                            .unwrap_or(p.cpu_pct);
+                        let plot = ((b - a).x * (b - a).y).sqrt();
+                        columns.push(Column {
+                            key: k,
+                            min: a,
+                            max: b,
+                            tall: height(plot, recent).min(side * 0.6),
+                            realm: p.realm,
+                        });
+                    }
+                    Item::Block(kind) => blocks.push(Block {
+                        kind,
+                        min: rmin,
+                        max: rmax,
+                        bytes: match kind {
+                            BlockKind::Free => (free * 1_048_576.0) as u64,
+                            BlockKind::KernelMemory => (kernel_mem * 1_048_576.0) as u64,
+                        },
+                    }),
+                }
             }
         }
-        let min = Vec2::new(-city_w / 2.0, -city_d / 2.0);
-        let max = Vec2::new(city_w / 2.0, city_d / 2.0);
-
-        // Kernel districts behind the Wall, one per subsystem.
-        let mut groups: BTreeMap<Subsystem, Vec<ProcKey>> =
-            Subsystem::ALL.iter().map(|s| (*s, vec![])).collect();
-        for p in s.processes.values().filter(|p| p.realm == Realm::Kernel) {
-            groups
-                .entry(Subsystem::classify(&p.name))
-                .or_default()
-                .push(p.key);
-        }
-        let wall_z = min.y - 3.0;
-        let kdims: Vec<i32> = groups
-            .values()
-            .map(|v| (v.len().max(1) as f32).sqrt().ceil() as i32)
-            .collect();
-        let kwidth: i32 = kdims.iter().map(|w| w + 3).sum::<i32>() - 3;
-        let mut kx = -(kwidth as f32) / 2.0 * CELL;
-        let mut kernel_sub = HashMap::new();
-        let mut district_pos = HashMap::new();
-        for ((sub, keys), w) in groups.iter().zip(kdims) {
-            let z0 = wall_z - 5.0;
-            district_pos.insert(
-                *sub,
-                Vec2::new(
-                    kx + (w - 1) as f32 * CELL / 2.0,
-                    z0 - (w - 1) as f32 * CELL / 2.0,
-                ),
-            );
-            for (i, k) in keys.iter().enumerate() {
-                let (row, col) = (i as i32 / w, i as i32 % w);
-                columns.push(Column::for_process(
-                    &s.processes[k],
-                    Vec3::new(kx + col as f32 * CELL, 0.0, z0 - row as f32 * CELL),
-                ));
-                kernel_sub.insert(*k, *sub);
-            }
-            kx += (w + 3) as f32 * CELL;
-        }
-
         let index = columns
             .iter()
             .enumerate()
             .map(|(i, c)| (c.key, i))
             .collect();
-        let extent = (city_w.max(city_d) / 2.0).max(6.0);
         Layout {
             columns,
+            blocks,
             index,
-            kernel_sub,
-            districts: district_pos,
             min,
             max,
-            extent,
+            extent: side / 2.0,
         }
     }
 
-    /// Z of the Blackwall plane (just behind the city).
-    pub fn wall_z(&self) -> f32 {
-        self.min.y - 3.0
-    }
-
-    pub fn wall_size(&self) -> (f32, f32) {
-        ((self.max.x - self.min.x) * 6.0 + 200.0, 34.0)
-    }
-
-    /// Center of a kernel subsystem's district, on the floor behind the Wall.
-    pub fn district_pos(&self, s: Subsystem) -> Vec3 {
-        let p = self
-            .districts
-            .get(&s)
-            .copied()
-            .unwrap_or(Vec2::new(0.0, self.wall_z() - 6.0));
-        Vec3::new(p.x, 0.0, p.y)
-    }
-
-    /// Base of the i-th volume column: lined up in front of the Wall, left of the city.
+    /// Base of the i-th storage volume: in a row just outside the RAM
+    /// square's near edge.
     pub fn volume_base(&self, i: usize) -> Vec3 {
-        Vec3::new(self.min.x - 3.0 - i as f32 * 2.0, 0.0, self.wall_z() + 1.5)
+        Vec3::new(self.min.x + 1.5 + i as f32 * 2.5, 0.0, self.max.y + 2.5)
     }
 
     pub fn column(&self, k: &ProcKey) -> Option<&Column> {
@@ -398,14 +419,10 @@ impl Layout {
         self.index.get(k).copied()
     }
 
-    /// Column tops, keyed by process (used for labels and camera follow).
+    /// Tower tops, keyed by process (used for labels and camera follow).
     pub fn positions(&self, out: &mut HashMap<ProcKey, Vec3>) {
         out.clear();
         out.extend(self.columns.iter().map(|c| (c.key, c.top())));
-    }
-
-    pub fn subsystem_of(&self, k: &ProcKey) -> Option<Subsystem> {
-        self.kernel_sub.get(k).copied()
     }
 }
 
@@ -414,66 +431,66 @@ mod tests {
     use super::*;
     use bw_platform::Collector;
     use bw_source::DemoWorld;
-    use std::collections::HashSet;
 
-    #[test]
-    fn every_process_has_its_own_column() {
-        let s = DemoWorld::new(1).sample();
-        let l = Layout::build(&s);
-        assert_eq!(l.columns.len(), s.processes.len());
-        let cells: HashSet<(i32, i32)> = l
-            .columns
-            .iter()
-            .map(|c| {
-                (
-                    (c.base.x * 10.0).round() as i32,
-                    (c.base.z * 10.0).round() as i32,
-                )
-            })
-            .collect();
-        assert_eq!(cells.len(), l.columns.len(), "two columns share a cell");
-        // The city stands in front of the Wall; the kernel behind it.
-        for c in &l.columns {
-            match c.realm {
-                Realm::User => assert!(c.base.z > l.wall_z()),
-                Realm::Kernel => assert!(c.base.z < l.wall_z()),
-            }
-            assert!(c.base.is_finite());
-        }
+    fn overlap(a: &Column, b: &Column) -> bool {
+        a.min.x < b.max.x - 1e-4
+            && b.min.x < a.max.x - 1e-4
+            && a.min.y < b.max.y - 1e-4
+            && b.min.y < a.max.y - 1e-4
     }
 
     #[test]
-    fn small_churn_keeps_most_columns_in_place() {
+    fn every_process_has_its_own_plot() {
+        let s = DemoWorld::new(1).sample();
+        let l = Layout::build(&s, &HashMap::new());
+        assert_eq!(l.columns.len(), s.processes.len());
+        for (i, a) in l.columns.iter().enumerate() {
+            assert!(a.min.cmplt(a.max).all(), "empty plot");
+            assert!(a.min.cmpge(l.min).all() && a.max.cmple(l.max).all());
+            for b in &l.columns[i + 1..] {
+                assert!(!overlap(a, b), "plots overlap");
+            }
+        }
+        // Free memory is open ground.
+        assert!(l.blocks.iter().any(|b| b.kind == BlockKind::Free));
+    }
+
+    #[test]
+    fn area_is_memory() {
+        let s = DemoWorld::new(1).sample();
+        let l = Layout::build(&s, &HashMap::new());
+        let area = |c: &Column| (c.max - c.min).x * (c.max - c.min).y;
+        let big = l
+            .columns
+            .iter()
+            .max_by_key(|c| s.processes[&c.key].mem_bytes)
+            .unwrap();
+        let small = l
+            .columns
+            .iter()
+            .min_by_key(|c| s.processes[&c.key].mem_bytes)
+            .unwrap();
+        assert!(area(big) > area(small) * 10.0);
+    }
+
+    #[test]
+    fn small_churn_keeps_the_map_steady() {
         let mut w = DemoWorld::new(1);
-        let a = Layout::build(&w.sample());
-        let b = Layout::build(&w.sample());
+        let a = Layout::build(&w.sample(), &HashMap::new());
+        let b = Layout::build(&w.sample(), &HashMap::new());
         let moved = a
             .columns
             .iter()
-            .filter(|c| b.column(&c.key).is_some_and(|d| d.base != c.base))
+            .filter(|c| {
+                b.column(&c.key)
+                    .is_some_and(|d| d.base().distance(c.base()) > 1.0)
+            })
             .count();
         assert!(
             moved * 4 < a.columns.len(),
-            "{moved} of {} columns moved",
+            "{moved} of {} towers moved",
             a.columns.len()
         );
-    }
-
-    #[test]
-    fn quantities_read_from_the_shape() {
-        let s = DemoWorld::new(1).sample();
-        let l = Layout::build(&s);
-        for c in &l.columns {
-            // Towers crowd but never touch.
-            assert!(c.half().max_element() * 2.0 < CELL);
-        }
-        // Ledges mark 10 MB, 100 MB, 1 GB: a 2 GB tower has three.
-        let mut p = s.processes.values().next().unwrap().clone();
-        p.realm = Realm::User;
-        p.mem_bytes = 2 << 30;
-        assert_eq!(ledges(levels(&p)).count(), 3);
-        p.mem_bytes = 5 << 20;
-        assert_eq!(ledges(levels(&p)).count(), 0);
     }
 
     #[test]

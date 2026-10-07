@@ -443,7 +443,7 @@ fn bottom_bar(root: &mut Ui, m: &Machine, settings: &SceneSettings, floor: &Floo
                 if settings.issues_only {
                     ui.label(RichText::new("ISSUES ONLY").font(semibold(10.0)).color(SIGNAL));
                 }
-                let hints = "↑↓←→ walk tree · Tab busiest · / search · drag orbit · WASD pan · F follow · Home overview · H hide · ? help";
+                let hints = "drag pan · wheel zoom · right-drag turn · click choose · zoom in to open · Tab busiest · N next issue · / search · ? help";
                 ui.label(RichText::new(hints).size(10.0).color(SIGNAL_DIM));
             });
         })
@@ -614,7 +614,7 @@ fn process_list(
         .width()
 }
 
-fn inspector(root: &mut Ui, m: &Machine, sel: &mut Selection, sl: &SceneLayout) -> f32 {
+fn inspector(root: &mut Ui, m: &Machine, sel: &mut Selection, _sl: &SceneLayout) -> f32 {
     egui::Panel::right("inspector")
         .frame(bare_frame(14, 8))
         .show_separator_line(false)
@@ -635,7 +635,7 @@ fn inspector(root: &mut Ui, m: &Machine, sel: &mut Selection, sl: &SceneLayout) 
                 glow_text(ui.painter(), r.left_center(), egui::Align2::LEFT_CENTER, &truncate(&p.name, 24), semibold(17.0), SELECT, OK);
             });
             let realm = match p.realm {
-                Realm::Kernel => format!("kernel side · {}", sl.layout.subsystem_of(&p.key).map(|s| s.label()).unwrap_or("kernel")),
+                Realm::Kernel => format!("kernel · {}", bw_scene::Subsystem::classify(&p.name).label().to_lowercase()),
                 Realm::User => "deep space (user)".into(),
             };
             ui.label(RichText::new(realm).size(10.0).color(SIGNAL_DIM));
@@ -802,26 +802,24 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                 .spacing(vec2(18.0, 4.0))
                 .show(ui, |ui| {
                     for (k, v) in [
-                        ("↑ / ↓", "parent / child"),
-                        ("← / →", "previous / next sibling"),
+                        ("Drag · WASD · arrows", "pan the map"),
+                        ("Wheel · pinch · +/-", "zoom toward the cursor"),
+                        ("Right-drag · Q / E", "turn (right-drag up/down tilts)"),
+                        ("Click", "choose a tower"),
+                        ("Click again · Enter · zoom in", "open it"),
+                        ("Zoom out · Esc", "close it, then clear the choice"),
+                        ("↑↓ / ←→ inside", "floors and slabs / pipes"),
                         ("Tab", "cycle the busiest processes"),
-                        ("Esc", "clear selection"),
+                        ("N", "next issue; inside: next anomaly"),
+                        ("Home", "the whole map"),
                         ("/  or  Ctrl/⌘+K", "search"),
-                        ("Enter / I", "toggle inspector"),
-                        ("L", "toggle process list"),
-                        ("H", "hide the whole HUD"),
-                        ("Drag · Shift+arrows", "orbit"),
-                        ("Right-drag · WASD · R/Shift+F", "pan"),
-                        ("Wheel · PgUp/PgDn · +/-", "zoom"),
-                        ("Pinch · two-finger drag", "zoom · pan (touch)"),
-                        ("F", "follow selection on/off"),
-                        ("Home", "overview"),
+                        ("I · L · H", "inspector · process list · hide HUD"),
                         (
                             "1 2 3 4 5",
-                            "family lines · kernel · streams · labels · issues only",
+                            "family cables · kernel · IO conduits · labels · issues only",
                         ),
                         ("M", "reduced motion"),
-                        ("Any key during start-up", "skip the jack-in"),
+                        ("Any key during start-up", "skip the arrival"),
                     ] {
                         ui.label(RichText::new(k).size(11.0).color(SIGNAL));
                         ui.label(RichText::new(v).size(11.0).color(SIGNAL_DIM));

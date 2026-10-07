@@ -10,7 +10,8 @@
 //! * **Conduits:** open descriptors as pipes of flowing dots: straight out of
 //!   the core, then files drop to storage below, sockets climb into the
 //!   dark, pipes and events run along the face.
-//! * **Satellites:** child processes as towers crowded round, cabled to it.
+//! * Children are not inside: they stand as towers of their own on the map,
+//!   cabled to this one.
 //!
 //! Color is health only; anomalies blink red or glow violet and raise a
 //! beacon. Pure functions build the model; one Bevy system turns it into a
@@ -158,7 +159,7 @@ fn thread_health(state: ProcState, cpu: f32) -> Health {
 }
 
 /// Lay out the interior world for one process.
-pub fn build(p: &Process, d: &ProcessDetail, snap: &Snapshot, anomalies: &[Anomaly]) -> Interior {
+pub fn build(p: &Process, d: &ProcessDetail, _snap: &Snapshot, anomalies: &[Anomaly]) -> Interior {
     let mut elements = Vec::new();
     let flagged = |k: &ElementKind| anomalies.iter().find(|a| &a.element == k);
 
@@ -237,46 +238,6 @@ pub fn build(p: &Process, d: &ProcessDetail, snap: &Snapshot, anomalies: &[Anoma
             health: a.map_or(Health::Healthy, |a| a.health),
             anomaly: a.map(|a| a.text.clone()),
             path: pts,
-            kind,
-        });
-    }
-
-    // Satellites: children crowded in rows along the core's faces, beyond
-    // the conduits, each cabled to the core.
-    let kids: Vec<&Process> = snap
-        .processes
-        .values()
-        .filter(|c| c.parent == Some(p.key))
-        .collect();
-    for (i, c) in kids.iter().enumerate() {
-        let (out, side) = face(i);
-        let slot = (i / 4) as f32;
-        let sign = if (slot as usize).is_multiple_of(2) {
-            1.0
-        } else {
-            -1.0
-        };
-        let along = (slot / 2.0).ceil() * sign * 1.6;
-        let pos = out * (CONDUIT_OUT + 2.5 + (i / 12) as f32 * 1.8) + side * along;
-        let col = crate::layout::Column::for_process(c, pos);
-        let h = col.height();
-        let hw = col.half();
-        let kind = ElementKind::Satellite { child: c.key };
-        elements.push(Element {
-            anchor: pos + Vec3::Y * h * 0.5,
-            reach: 6.0 + h * 0.5,
-            min: pos - Vec3::new(hw.x + 0.1, 0.0, hw.y + 0.1),
-            max: pos + Vec3::new(hw.x + 0.1, h, hw.y + 0.1),
-            label: format!("{} · {}", c.name, c.key.pid),
-            health: c.health(),
-            anomaly: c
-                .health_reason()
-                .filter(|_| c.health() != Health::Healthy)
-                .map(String::from),
-            path: vec![
-                out * CORE_R + Vec3::Y * (h * 0.8),
-                pos + Vec3::Y * (h * 0.8),
-            ],
             kind,
         });
     }

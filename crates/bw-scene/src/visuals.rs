@@ -1,66 +1,25 @@
-//! Scene entities other than the dots: the Wall, world labels, logical
-//! process entities (for labels, camera follow and navigation) and the
-//! family lines of the selection (PLAN §6, v3 look).
+//! Scene entities other than the meshes: world labels for the map's blocks
+//! and volumes, logical process entities (for labels, camera follow and the
+//! HUD) and the beam over the chosen tower.
 
-use crate::layout::Subsystem;
-use crate::quality::Quality;
-use crate::wall::WallMaterial;
+use crate::layout::BlockKind;
 use crate::*;
 use bevy::color::LinearRgba;
 
 pub(crate) fn plugin(app: &mut App) {
-    app.add_systems(Startup, setup).add_systems(
+    app.add_systems(
         Update,
-        (
-            sync_entities,
-            track_columns,
-            update_wall,
-            update_labels,
-            draw_lines,
-        )
+        (sync_entities, track_columns, update_labels, draw_lines)
             .chain()
             .in_set(SceneSet::Visuals),
     );
 }
 
 #[derive(Component)]
-struct WallSurface;
+struct MapLabel(usize);
 
-#[derive(Component)]
-struct SubsystemLabel(Subsystem);
-
-#[derive(Component)]
-struct VolumeLabel(usize);
-
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut wall_mats: ResMut<Assets<WallMaterial>>,
-) {
-    // The Wall; resized once the first layout is known.
-    commands.spawn((
-        WallSurface,
-        crate::explore::MachineLayer,
-        Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
-        MeshMaterial3d(wall_mats.add(WallMaterial::default())),
-        Transform::from_xyz(0.0, 17.0, -40.0),
-    ));
-    for s in Subsystem::ALL {
-        commands.spawn((
-            SubsystemLabel(s),
-            crate::explore::MachineLayer,
-            Transform::default(),
-            Visibility::default(),
-            WorldLabel {
-                text: s.label().into(),
-                kind: LabelKind::Subsystem,
-            },
-        ));
-    }
-}
-
-/// Logical entities for processes: no mesh (the dots are in the city mesh),
-/// but labels, navigation and the camera follow them.
+/// Logical entities for processes: no mesh (the towers are one mesh),
+/// but labels, the HUD and the camera follow them.
 fn sync_entities(
     mut commands: Commands,
     m: Res<Machine>,
@@ -117,78 +76,49 @@ fn track_columns(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_wall(
-    m: Res<Machine>,
-    sl: Res<SceneLayout>,
-    settings: Res<SceneSettings>,
-    quality: Res<Quality>,
-    time: Res<Time>,
-    jack: Res<crate::camera::JackIn>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut wall_mats: ResMut<Assets<WallMaterial>>,
-    mut q: Query<(&mut Transform, &Mesh3d, &MeshMaterial3d<WallMaterial>), With<WallSurface>>,
-    mut pressure: Local<f32>,
-    mut clock: Local<f32>,
-    mut last_size: Local<(f32, f32)>,
-) {
-    let Ok((mut tf, mesh, mat)) = q.single_mut() else {
-        return;
-    };
-    let size = sl.layout.wall_size();
-    if (size.0 - last_size.0).abs() > 1.0 || (size.1 - last_size.1).abs() > 1.0 {
-        *last_size = size;
-        if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
-            *mesh = Rectangle::new(size.0, size.1).into();
-        }
-    }
-    tf.translation = Vec3::new(0.0, size.1 / 2.0, sl.layout.wall_z());
-    let dt = time.delta_secs();
-    *pressure += (m.snapshot.system.kernel_pressure - *pressure) * (1.0 - (-dt * 1.5).exp());
-    // The rain runs on its own clock so the jack-in can speed it up smoothly;
-    // under reduced motion it stands still.
-    if !settings.reduced_motion {
-        *clock += dt * jack.rain_boost();
-    }
-    if let Some(mut w) = wall_mats.get_mut(&mat.0) {
-        let glitch = if settings.reduced_motion { 0.0 } else { 1.0 };
-        w.params.state = Vec4::new(*pressure, *clock, glitch, quality.tier.wall_intensity());
-        w.params.extra = Vec4::new(1.0, size.1, 0.0, 0.0);
-    }
-}
-
-#[allow(clippy::type_complexity)]
+/// Labels on the map: the kernel's own memory and free memory (on their
+/// blocks), and each volume.
 fn update_labels(
     mut commands: Commands,
     m: Res<Machine>,
     sl: Res<SceneLayout>,
     settings: Res<SceneSettings>,
-    ex: Res<crate::explore::Explore>,
-    sel: Res<Selection>,
-    mut subs: Query<(&SubsystemLabel, &mut Transform, &mut Visibility), Without<VolumeLabel>>,
-    mut vols: Query<
-        (Entity, &VolumeLabel, &mut Transform, &mut WorldLabel),
-        Without<SubsystemLabel>,
-    >,
+    mut q: Query<(
+        Entity,
+        &MapLabel,
+        &mut Transform,
+        &mut WorldLabel,
+        &mut Visibility,
+    )>,
 ) {
-    for (s, mut tf, mut vis) in &mut subs {
-        tf.translation = sl.layout.district_pos(s.0) + Vec3::Y * 1.2;
-        // Named only from the overview; at street level they'd be clutter.
-        *vis = if settings.show_kernel && ex.inside().is_none() && sel.key.is_none() {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
+    let lay = &sl.layout;
+    let mut want: Vec<(Vec3, String, LabelKind)> = Vec::new();
+    for b in &lay.blocks {
+        let c = (b.min + b.max) * 0.5;
+        let (text, kind) = match b.kind {
+            BlockKind::KernelMemory => {
+                (format!("KERNEL {}", fmt_mb(b.bytes)), LabelKind::Subsystem)
+            }
+            BlockKind::Free => (format!("FREE {}", fmt_mb(b.bytes)), LabelKind::Volume),
         };
+        want.push((Vec3::new(c.x, 1.2, c.y), text, kind));
     }
-    let volumes = &m.snapshot.volumes;
-    if vols.iter().count() != volumes.len() {
-        for (e, ..) in &vols {
+    for (i, v) in m.snapshot.volumes.iter().enumerate() {
+        let levels =
+            (8.0 + (v.total_bytes as f32 / (1u64 << 30) as f32).max(1.0).log2() * 2.0).round();
+        want.push((
+            lay.volume_base(i) + Vec3::Y * (levels * crate::layout::LEVEL_H),
+            format!("{} {:.0}%", v.mount, v.used_pct()),
+            LabelKind::Volume,
+        ));
+    }
+    if q.iter().count() != want.len() {
+        for (e, ..) in &q {
             commands.entity(e).despawn();
         }
-        for i in 0..volumes.len() {
+        for i in 0..want.len() {
             commands.spawn((
-                VolumeLabel(i),
-                crate::explore::MachineLayer,
+                MapLabel(i),
                 Transform::default(),
                 Visibility::default(),
                 WorldLabel {
@@ -199,22 +129,22 @@ fn update_labels(
         }
         return;
     }
-    for (_, v, mut tf, mut label) in &mut vols {
-        let Some(vol) = volumes.get(v.0) else {
+    for (_, l, mut tf, mut label, mut vis) in &mut q {
+        let Some((pos, text, kind)) = want.get(l.0) else {
             continue;
         };
-        let levels = (8.0
-            + (vol.total_bytes as f32 / (1u64 << 30) as f32)
-                .max(1.0)
-                .log2()
-                * 2.0)
-            .round();
-        tf.translation = sl.layout.volume_base(v.0) + Vec3::Y * (levels * crate::layout::LEVEL_H);
-        label.text = format!("{} {:.0}%", vol.mount, vol.used_pct());
+        tf.translation = *pos;
+        label.text.clone_from(text);
+        label.kind = *kind;
+        *vis = if settings.show_labels {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
     }
 }
 
-/// A short white beam above the selected tower. Family and IO are drawn as
+/// A short white beam above the chosen tower. Family and IO are drawn as
 /// cables and conduits in the dot mesh (`city.rs`).
 fn draw_lines(
     sl: Res<SceneLayout>,
@@ -225,9 +155,7 @@ fn draw_lines(
     if ex.inside().is_some() {
         return;
     }
-    let lay = &sl.layout;
-    // A beam above the selected column.
-    if let Some(c) = sel.key.and_then(|k| lay.column(&k)) {
+    if let Some(c) = sel.key.and_then(|k| sl.layout.column(&k)) {
         gizmos.line(
             c.top() + Vec3::Y * 0.2,
             c.top() + Vec3::Y * 2.5,

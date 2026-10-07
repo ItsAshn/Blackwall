@@ -1,19 +1,21 @@
-//! Guided exploration: three levels, moved between by choosing, never by
-//! free flight.
+//! Exploration as semantic zoom: choosing, opening and walking towers.
 //!
-//! 1. **Machine**: towers at human scale. Choosing one (click, arrows, Tab,
-//!    N for the next tower with an issue) flies the camera low to its foot.
-//! 2. **Inside a process**: Enter dives through black into a world of its
-//!    own (see `interior.rs`).
-//! 3. **An element**: a floor, stratum, conduit or satellite; the camera
-//!    flies to it. N visits the next anomaly. Enter on a satellite dives
-//!    into that child. Esc climbs back out one level at a time.
+//! * **Choose** a tower (click, Tab for the busiest, N for the next with an
+//!   issue): the camera frames it and the source starts collecting its
+//!   internals.
+//! * **Open** it by zooming in close (scroll), Enter, or clicking it again:
+//!   its walls fall away to an outline and the process's interior stands in
+//!   their place, scaled to the plot (see `interior.rs`). There is no fade
+//!   and no separate world; zoom back out and it closes.
+//! * **Inside**, click an element or walk them (↑↓ floors and slabs, ←→
+//!   pipes); N visits the next anomaly. Esc steps back out one level at a
+//!   time: element → tower → map.
 
 use crate::camera::{InputBlock, OrbitCam};
 use crate::city::DotMeshBuilder;
 use crate::interior::{self, Anomaly, ELEMENT_ID_BASE, ElementKind, Interior};
 use crate::*;
-use bw_model::{Health, ProcessDetail, Realm};
+use bw_model::{Health, ProcessDetail};
 use crossbeam_channel::Sender;
 
 pub(crate) fn plugin(app: &mut App) {
@@ -23,10 +25,10 @@ pub(crate) fn plugin(app: &mut App) {
             Update,
             (
                 explore_input,
-                run_fade,
+                follow_selection,
+                open_close,
                 rebuild_interior,
                 place_camera,
-                layer_visibility,
             )
                 .chain()
                 .after(SceneSet::Layout)
@@ -45,12 +47,16 @@ pub enum Level {
 #[derive(Resource, Default)]
 pub struct SourceFocus(pub Option<Sender<Option<ProcKey>>>);
 
+/// Half the interior's width at scale 1 (the farthest pipes), used to fit
+/// it to a plot.
+const INTERIOR_HALF: f32 = 13.5;
+
 #[derive(Resource)]
 pub struct Explore {
     pub level: Level,
-    /// The level being faded toward; switched at full black.
+    /// An open or close requested by input, applied once per frame.
     pending: Option<Level>,
-    /// 0 = clear, 1 = black.
+    /// Kept for the HUD's fade overlay; zooming never fades.
     pub fade: f32,
     pub interior: Interior,
     pub anomalies: Vec<Anomaly>,
@@ -59,11 +65,14 @@ pub struct Explore {
     /// Chosen and hovered interior elements (indices into `interior.elements`).
     pub element: Option<usize>,
     pub hovered: Option<usize>,
-    /// When the current interior was entered, for its grow-in.
+    /// When the current interior was opened, for its grow-in.
     entered_at: f32,
-    /// Bumped whenever the camera should fly to a new station.
+    /// Bumped whenever the camera should move to a new station.
     station: u64,
     pub interior_mesh: Option<Handle<Mesh>>,
+    /// Where the interior stands: its origin on the plot and its scale.
+    pub origin: Vec3,
+    pub scale: f32,
 }
 
 impl Default for Explore {
@@ -81,6 +90,8 @@ impl Default for Explore {
             entered_at: 0.0,
             station: 0,
             interior_mesh: None,
+            origin: Vec3::ZERO,
+            scale: 1.0,
         }
     }
 }
@@ -93,15 +104,14 @@ impl Explore {
         }
     }
 
+    /// Open a tower (zoom into it).
     pub fn dive(&mut self, k: ProcKey) {
-        info!("explore: dive requested into {k}");
-        if self.pending.is_none() {
-            self.pending = Some(Level::Inside(k));
-        }
+        self.pending = Some(Level::Inside(k));
     }
 
+    /// Close the open tower (zoom back out to it).
     pub fn surface(&mut self) {
-        if self.pending.is_none() && self.inside().is_some() {
+        if self.inside().is_some() {
             self.pending = Some(Level::Machine);
         }
     }
@@ -114,9 +124,19 @@ impl Explore {
     pub fn element_id(&self, i: Option<usize>) -> f32 {
         i.map_or(-1.0, |i| (ELEMENT_ID_BASE + i) as f32)
     }
+
+    /// An interior point in world space.
+    pub fn to_world(&self, p: Vec3) -> Vec3 {
+        self.origin + p * self.scale
+    }
+
+    /// A world point in interior space.
+    pub fn to_local(&self, p: Vec3) -> Vec3 {
+        (p - self.origin) / self.scale
+    }
 }
 
-/// Marks entities that belong to the machine level (hidden inside a process).
+/// Marks entities that belong to the machine level.
 #[derive(Component)]
 pub struct MachineLayer;
 
@@ -157,6 +177,13 @@ fn step(list: &[usize], cur: Option<usize>, dir: i32) -> Option<usize> {
     }
 }
 
+/// The interior's frame for a tower: centered on its plot, scaled so the
+/// widest part fits the plot.
+fn frame_for(c: &crate::layout::Column) -> (Vec3, f32) {
+    let half = c.half().min_element();
+    (c.base(), (half / INTERIOR_HALF).max(0.004))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn explore_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -167,23 +194,22 @@ fn explore_input(
     mut cam: ResMut<OrbitCam>,
     sl: Res<SceneLayout>,
 ) {
-    if block.keyboard || ex.pending.is_some() {
+    if block.keyboard {
         return;
     }
+    let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
     match ex.level {
         Level::Machine => {
-            if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter))
-                && let Some(k) = sel.key
-            {
+            if enter && let Some(k) = sel.key {
                 ex.dive(k);
             }
-            // N: the next tower with an issue.
+            // N: the next tower with an issue, worst first.
             if keys.just_pressed(KeyCode::KeyN) {
                 let mut flagged: Vec<&bw_model::Process> = m
                     .snapshot
                     .processes
                     .values()
-                    .filter(|p| p.health() != Health::Healthy && p.realm == Realm::User)
+                    .filter(|p| p.health() != Health::Healthy)
                     .collect();
                 flagged.sort_by(|a, b| b.health().cmp(&a.health()).then(a.key.cmp(&b.key)));
                 let keys: Vec<ProcKey> = flagged.iter().map(|p| p.key).collect();
@@ -195,6 +221,24 @@ fn explore_input(
                     sel.key = next;
                     sel.follow = true;
                 }
+            }
+            // Tab: the busiest towers in turn.
+            if keys.just_pressed(KeyCode::Tab) {
+                let mut busy: Vec<&bw_model::Process> = m.snapshot.processes.values().collect();
+                busy.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct).then(a.key.cmp(&b.key)));
+                let keys: Vec<ProcKey> = busy.iter().take(12).map(|p| p.key).collect();
+                let next = match sel.key.and_then(|k| keys.iter().position(|x| *x == k)) {
+                    Some(i) => keys.get((i + 1) % keys.len()).copied(),
+                    None => keys.first().copied(),
+                };
+                if next.is_some() {
+                    sel.key = next;
+                    sel.follow = true;
+                }
+            }
+            if keys.just_pressed(KeyCode::Escape) && sel.key.is_some() {
+                sel.key = None;
+                cam.frame_all(sl.layout.extent);
             }
             if keys.just_pressed(KeyCode::Home) {
                 sel.key = None;
@@ -208,16 +252,7 @@ fn explore_input(
                 |k| matches!(k, ElementKind::Floor { .. } | ElementKind::Stratum { .. }),
                 true,
             );
-            let around = order_by(
-                it,
-                |k| {
-                    matches!(
-                        k,
-                        ElementKind::Conduit { .. } | ElementKind::Satellite { .. }
-                    )
-                },
-                false,
-            );
+            let around = order_by(it, |k| matches!(k, ElementKind::Conduit { .. }), false);
             let cur = ex.element;
             let mut next = None;
             if keys.just_pressed(KeyCode::ArrowUp) {
@@ -239,13 +274,6 @@ fn explore_input(
             if next.is_some() {
                 ex.choose(next);
             }
-            if (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter))
-                && let Some(ElementKind::Satellite { child }) =
-                    ex.element.map(|i| ex.interior.elements[i].kind.clone())
-            {
-                sel.key = Some(child);
-                ex.dive(child);
-            }
             if keys.just_pressed(KeyCode::Escape) {
                 if ex.element.is_some() {
                     ex.choose(None);
@@ -255,61 +283,115 @@ fn explore_input(
             }
             if keys.just_pressed(KeyCode::Home) {
                 ex.surface();
+                sel.key = None;
+                cam.frame_all(sl.layout.extent);
             }
         }
     }
 }
 
-/// Fade to black, switch levels at full black, fade back in.
-fn run_fade(
-    time: Res<Time>,
-    mut ex: ResMut<Explore>,
+/// A newly chosen tower: frame it and ask the source for its internals.
+fn follow_selection(
+    sel: Res<Selection>,
+    sl: Res<SceneLayout>,
     focus: Res<SourceFocus>,
+    mut ex: ResMut<Explore>,
+    mut cam: ResMut<OrbitCam>,
+    mut last: Local<Option<ProcKey>>,
+) {
+    if *last == sel.key {
+        return;
+    }
+    *last = sel.key;
+    if let Some(tx) = &focus.0 {
+        let _ = tx.send(sel.key);
+    }
+    // Choosing another tower closes the open one.
+    if ex.inside().is_some() && ex.inside() != sel.key {
+        ex.pending = Some(Level::Machine);
+    }
+    if let Some(c) = sel.key.and_then(|k| sl.layout.column(&k))
+        && sel.follow
+    {
+        let size = c.half().max_element().max(c.height() * 0.6);
+        cam.frame(c.center(), size);
+    }
+}
+
+/// Apply requested opens and closes, and open or close by zoom alone.
+#[allow(clippy::too_many_arguments)]
+fn open_close(
+    time: Res<Time>,
+    m: Res<Machine>,
+    sl: Res<SceneLayout>,
+    mut ex: ResMut<Explore>,
     mut sel: ResMut<Selection>,
     mut cam: ResMut<OrbitCam>,
-    sl: Res<SceneLayout>,
-    settings: Res<SceneSettings>,
 ) {
-    let dt = time.delta_secs();
-    let speed = if settings.reduced_motion { 8.0 } else { 3.0 };
-    if let Some(target) = ex.pending {
-        ex.fade = (ex.fade + dt * speed).min(1.0);
-        if ex.fade >= 1.0 {
-            let was = ex.inside();
-            info!("explore: {:?} → {:?}", ex.level, target);
-            ex.level = target;
-            ex.pending = None;
-            ex.element = None;
-            ex.hovered = None;
-            ex.station += 1;
-            if let Some(tx) = &focus.0 {
-                let _ = tx.send(ex.inside());
-            }
-            match target {
-                Level::Inside(_) => {
-                    ex.detail = None;
-                    ex.history.clear();
-                    ex.anomalies.clear();
-                    ex.interior = Interior::default();
-                    ex.entered_at = time.elapsed_secs();
-                    // Arrive high above the core, looking down into it.
-                    cam.focus = Vec3::new(0.0, 12.0, 0.0);
-                    cam.dist = 70.0;
-                    cam.pitch = 0.9;
-                }
-                Level::Machine => {
-                    // Surface at the foot of the tower we were inside.
-                    sel.key = was;
-                    sel.follow = true;
-                    if let Some(c) = was.and_then(|k| sl.layout.column(&k)) {
-                        cam.focus = c.top();
-                        cam.dist = 2.0;
+    // Zoom alone: close in on the chosen tower and it opens; pull back out
+    // past it and it closes.
+    if ex.pending.is_none() {
+        match ex.level {
+            Level::Machine => {
+                if let Some(c) = sel.key.and_then(|k| sl.layout.column(&k)) {
+                    let reach = c.half().max_element() * 1.6 + 0.4;
+                    let over = Vec2::new(cam.t_focus.x, cam.t_focus.z);
+                    let on_plot = over.cmpge(c.min - 0.3).all() && over.cmple(c.max + 0.3).all();
+                    if cam.moved && cam.t_dist < reach && on_plot {
+                        ex.pending = Some(Level::Inside(c.key));
                     }
                 }
             }
+            Level::Inside(k) => {
+                let fit = sl
+                    .layout
+                    .column(&k)
+                    .map_or(4.0, |c| c.half().max_element() * 4.5 + 1.5);
+                if cam.moved && cam.t_dist > fit {
+                    ex.pending = Some(Level::Machine);
+                }
+            }
         }
-    } else if ex.fade > 0.0 {
-        ex.fade = (ex.fade - dt * speed * 0.7).max(0.0);
+    }
+    let Some(target) = ex.pending.take() else {
+        return;
+    };
+    if target == ex.level {
+        return;
+    }
+    let was = ex.inside();
+    ex.level = target;
+    ex.element = None;
+    ex.hovered = None;
+    ex.station += 1;
+    match target {
+        Level::Inside(k) => {
+            let Some(c) = sl.layout.column(&k) else {
+                ex.level = Level::Machine;
+                return;
+            };
+            info!("explore: open {k}");
+            sel.key = Some(k);
+            let (origin, scale) = frame_for(c);
+            ex.origin = origin;
+            ex.scale = scale;
+            if m.detail.as_ref().and_then(|d| d.key) != Some(k) {
+                ex.detail = None;
+            }
+            ex.history.clear();
+            ex.anomalies.clear();
+            ex.interior = Interior::default();
+            ex.entered_at = time.elapsed_secs();
+            cam.min_dist = scale * 4.0;
+        }
+        Level::Machine => {
+            info!("explore: close {was:?}");
+            cam.min_dist = 1.2;
+            if let Some(c) = was.and_then(|k| sl.layout.column(&k)) {
+                let size = c.half().max_element().max(c.height() * 0.6);
+                cam.frame(c.center(), size);
+            }
+        }
     }
 }
 
@@ -321,7 +403,8 @@ fn rebuild_interior(
     mut ex: ResMut<Explore>,
     mut meshes: ResMut<Assets<Mesh>>,
     mats: Res<crate::city::CityHandles>,
-    mut last_gen: Local<u64>,
+    mut q: Query<&mut Visibility, With<InteriorLayer>>,
+    mut last: Local<(u64, Option<ProcKey>)>,
 ) {
     if ex.interior_mesh.is_none() {
         let h = meshes.add(DotMeshBuilder::default().into_mesh());
@@ -335,14 +418,27 @@ fn rebuild_interior(
         ));
         ex.interior_mesh = Some(h);
     }
-    let Some(key) = ex.inside() else { return };
-    if m.detail_gen == *last_gen {
+    let want = if ex.inside().is_some() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut q {
+        if *v != want {
+            *v = want;
+        }
+    }
+    let Some(key) = ex.inside() else {
+        *last = (0, None);
+        return;
+    };
+    if *last == (m.detail_gen, Some(key)) {
         return;
     }
-    *last_gen = m.detail_gen;
     let Some(d) = m.detail.as_ref().filter(|d| d.key == Some(key)) else {
         return;
     };
+    *last = (m.detail_gen, Some(key));
     let Some(p) = m.snapshot.processes.get(&key) else {
         // The process exited while we were inside it.
         ex.surface();
@@ -361,8 +457,15 @@ fn rebuild_interior(
     if first {
         ex.station += 1;
     }
-    let born = ex.entered_at + 0.2;
-    let mesh = crate::city::interior_mesh(&ex.interior, d, &m.snapshot, born, time.elapsed_secs());
+    let born = ex.entered_at + 0.1;
+    let mesh = crate::city::interior_mesh(
+        &ex.interior,
+        d,
+        born,
+        time.elapsed_secs(),
+        ex.origin,
+        ex.scale,
+    );
     if let Some(h) = &ex.interior_mesh
         && let Some(mut target) = meshes.get_mut(h)
     {
@@ -370,73 +473,24 @@ fn rebuild_interior(
     }
 }
 
-/// Fly the camera to the station for whatever is chosen.
-fn place_camera(
-    ex: Res<Explore>,
-    sel: Res<Selection>,
-    sl: Res<SceneLayout>,
-    jack: Res<crate::camera::JackIn>,
-    mut cam: ResMut<OrbitCam>,
-    mut last: Local<(u64, Option<ProcKey>, bool, bool)>,
-) {
-    // The jack-in owns the camera until it is done.
-    let key = (ex.station, sel.key, ex.inside().is_some(), jack.done);
-    if *last == key || ex.pending.is_some() || jack.running() {
+/// Move the camera to whatever was just chosen inside.
+fn place_camera(ex: Res<Explore>, mut cam: ResMut<OrbitCam>, mut last: Local<u64>) {
+    if *last == ex.station {
         return;
     }
-    *last = key;
-    match ex.level {
-        Level::Machine => match sel.key.and_then(|k| sl.layout.column(&k)) {
-            // Stand low at the tower's foot and look up at it.
-            Some(c) => {
-                let h = c.height();
-                cam.t_focus = c.base + Vec3::Y * (h * 0.6 + 0.4);
-                cam.t_dist = h * 0.55 + 3.2;
-                cam.t_pitch = -0.12;
-            }
-            None if cam.framed => cam.frame_all(sl.layout.extent),
-            None => {}
-        },
-        Level::Inside(_) => match ex.element.and_then(|i| ex.interior.elements.get(i)) {
-            Some(e) => {
-                cam.t_focus = e.anchor;
-                cam.t_dist = e.reach;
-                cam.t_pitch = 0.12;
-            }
-            None => {
-                let h = ex.interior.height.max(12.0);
-                cam.t_focus = Vec3::new(0.0, h * 0.45, 0.0);
-                cam.t_dist = h * 1.15 + 14.0;
-                cam.t_pitch = 0.22;
-            }
-        },
+    *last = ex.station;
+    if ex.inside().is_none() {
+        return;
     }
-}
-
-fn layer_visibility(
-    ex: Res<Explore>,
-    mut machine: Query<&mut Visibility, (With<MachineLayer>, Without<InteriorLayer>)>,
-    mut inner: Query<&mut Visibility, (With<InteriorLayer>, Without<MachineLayer>)>,
-) {
-    let inside = ex.inside().is_some();
-    for mut v in &mut machine {
-        let want = if inside {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
-        if *v != want {
-            *v = want;
+    match ex.element.and_then(|i| ex.interior.elements.get(i)) {
+        Some(e) => {
+            cam.t_focus = ex.to_world(e.anchor);
+            cam.t_dist = (e.reach * ex.scale).max(cam.min_dist);
         }
-    }
-    for mut v in &mut inner {
-        let want = if inside {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
-        if *v != want {
-            *v = want;
+        None => {
+            let h = ex.interior.height.max(12.0);
+            cam.t_focus = ex.to_world(Vec3::new(0.0, h * 0.4, 0.0));
+            cam.t_dist = ((h * 0.9 + 16.0) * ex.scale).max(cam.min_dist);
         }
     }
 }

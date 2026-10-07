@@ -302,10 +302,13 @@ pub fn hint(ctx: &egui::Context, ex: &Explore, sel: &Selection) {
                 1 => "1 anomaly · N to visit".to_string(),
                 n => format!("{n} anomalies · N to visit"),
             };
-            format!("{lead}   ↑↓ floors and strata · ←→ conduits · / search · Esc surface")
+            format!("{lead}   ↑↓ floors and slabs · ←→ pipes · zoom out or Esc to close")
         }
-        None if sel.key.is_some() => "Enter to dive in · click again to dive · Tab busiest · N next issue · / search · Esc back".to_string(),
-        None => "click a tower or press Tab · N next issue · / search · ? help".to_string(),
+        None if sel.key.is_some() => {
+            "zoom in, Enter or click again to open · drag to pan · N next issue · Esc back"
+                .to_string()
+        }
+        None => "drag to pan · scroll to zoom · click a tower · N next issue · ? help".to_string(),
     };
     let font = egui::FontId::monospace(10.0);
     let w = painter

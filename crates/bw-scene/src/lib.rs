@@ -1,4 +1,5 @@
-//! Blackwall's 3D scene: Deep Space, the Wall, and the kernel behind it.
+//! Blackwall's 3D scene: the machine as a map of RAM, its processes as
+//! towers on it, and the Wall round it.
 //!
 //! Engine-specific code lives only here and in `bw-ui` (PLAN §4.1). The scene
 //! consumes [`bw_model::Update`]s from any source through [`SourceRx`].
@@ -8,10 +9,10 @@ mod city;
 pub mod explore;
 pub mod interior;
 pub mod layout;
-pub mod nav;
 pub mod palette;
 mod pick;
 pub mod quality;
+mod towers;
 mod visuals;
 mod wall;
 
@@ -165,10 +166,10 @@ impl Plugin for ScenePlugin {
         explore::plugin(app);
         wall::plugin(app);
         city::plugin(app);
+        towers::plugin(app);
         visuals::plugin(app);
         pick::plugin(app);
         camera::plugin(app);
-        nav::plugin(app);
         quality::plugin(app);
     }
 }
@@ -252,7 +253,7 @@ fn update_layout(
 ) {
     if m.generation != *last_gen {
         *last_gen = m.generation;
-        sl.layout = Layout::build(&m.snapshot);
+        sl.layout = Layout::build(&m.snapshot, &m.cpu_history);
     }
     if !settings.reduced_motion {
         sl.t += time.delta_secs();
