@@ -172,6 +172,7 @@ fn whisper_at(painter: &egui::Painter, anchor: Pos2, lines: &[(String, Color32)]
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn whisper(
     ctx: &egui::Context,
     camera: &Camera,
@@ -180,6 +181,7 @@ pub fn whisper(
     sel: &Selection,
     ex: &Explore,
     sl: &SceneLayout,
+    sus: &bw_scene::Suspicions,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     match ex.inside() {
@@ -198,6 +200,10 @@ pub fn whisper(
                     let mut lines = process_lines(p);
                     if !strong {
                         lines.truncate(2);
+                    }
+                    // Why it is suspicious, in the Wall's magenta.
+                    for s in sus.of_process(k).take(if strong { 4 } else { 1 }) {
+                        lines.push((format!("{}: {}", s.family.label(), s.text), WALL_CALM));
                     }
                     whisper_at(&painter, pos, &lines, strong);
                     shown.push(k);
@@ -237,6 +243,101 @@ pub fn whisper(
 }
 
 /// Chevrons at the screen's edge toward anomalies outside the view.
+/// The hovered gate, ghost or remote address.
+pub fn landmark(
+    ctx: &egui::Context,
+    camera: &Camera,
+    cam_tf: &GlobalTransform,
+    marks: &bw_scene::Landmarks,
+) {
+    let Some(l) = marks.hovered.and_then(|i| marks.list.get(i)) else {
+        return;
+    };
+    let top = Vec3::new(
+        (l.min.x + l.max.x) * 0.5,
+        l.max.y,
+        (l.min.z + l.max.z) * 0.5,
+    );
+    if let Some(pos) = project(camera, cam_tf, top) {
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let lines = vec![
+            (l.title.clone(), if l.suspect { WALL_CALM } else { SELECT }),
+            (l.detail.clone(), SIGNAL_DIM),
+        ];
+        whisper_at(&painter, pos, &lines, true);
+    }
+}
+
+/// The verdict: what the system is doing and what needs attention, in one
+/// line under the breadcrumb.
+pub fn verdict(ctx: &egui::Context, m: &Machine, sus: &bw_scene::Suspicions) {
+    use bw_model::FirewallStatus;
+    let s = &m.snapshot;
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let issues = s
+        .processes
+        .values()
+        .filter(|p| p.health() == Health::Critical)
+        .count();
+    let watch = s
+        .processes
+        .values()
+        .filter(|p| p.health() == Health::Warning)
+        .count();
+    let suspects = bw_scene::suspect::by_target(&sus.list).len();
+    let dormant = m.dormant().len();
+    let exposed = s.net.listening.iter().filter(|l| l.exposed).count();
+    let ram = s.system.mem_used as f32 / s.system.mem_total.max(1) as f32 * 100.0;
+    let mut parts: Vec<(String, Color32)> = vec![(
+        format!("CPU {:.0}% · RAM {:.0}%", s.system.cpu_pct, ram),
+        SIGNAL_DIM,
+    )];
+    if suspects > 0 {
+        parts.push((format!("{suspects} suspicious"), WALL_CALM));
+    }
+    if issues > 0 {
+        parts.push((format!("{issues} issues"), ISSUE));
+    }
+    if watch > 0 {
+        parts.push((format!("{watch} to watch"), WATCH));
+    }
+    if dormant > 0 {
+        parts.push((format!("{dormant} dormant services"), SIGNAL_DIM));
+    }
+    parts.push((
+        format!(
+            "{exposed} open ports{}",
+            match s.net.firewall.status {
+                FirewallStatus::Unknown => " · firewall rules unknown (F)",
+                FirewallStatus::Inactive => " · firewall off",
+                FirewallStatus::Active => "",
+            }
+        ),
+        if s.net.firewall.status == FirewallStatus::Active {
+            SIGNAL_DIM
+        } else {
+            WATCH
+        },
+    ));
+    let font = egui::FontId::monospace(11.0);
+    let mut x = 16.0;
+    for (i, (text, color)) in parts.iter().enumerate() {
+        let t = if i == 0 {
+            text.clone()
+        } else {
+            format!("· {text}")
+        };
+        let r = painter.text(
+            Pos2::new(x, 40.0),
+            egui::Align2::LEFT_TOP,
+            t,
+            font.clone(),
+            *color,
+        );
+        x = r.right() + 8.0;
+    }
+}
+
 pub fn compass(ctx: &egui::Context, camera: &Camera, cam_tf: &GlobalTransform, ex: &Explore) {
     if ex.inside().is_none() {
         return;

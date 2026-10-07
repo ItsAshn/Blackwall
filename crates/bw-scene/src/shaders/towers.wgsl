@@ -71,10 +71,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let t = params.a.x;
     let id = in.uv_b.x;
     var realm = in.uv_b.y;
+    let suspect = realm > 40.0;
+    if (suspect) {
+        realm = realm - 50.0;
+    }
     let dying = realm > 5.0;
     if (dying) {
         realm = realm - 10.0;
     }
+    let ghost = abs(realm - 3.0) < 0.5;
     let roof = in.tangent.z > 0.5;
     let w = in.tangent.x;
     let h = in.tangent.y;
@@ -115,11 +120,30 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let fw = max(fwidth(u), fwidth(v));
     let rim = 1.0 - smoothstep(0.0, 0.025 + fw * 1.5, edge);
 
+    // A dormant service: a hollow ghost of edges and faint scanlines that
+    // drift down, as if it were fading out of memory.
+    if (ghost) {
+        let scan = 1.0 - smoothstep(0.0, 0.02 + fw, abs(fract(v * 4.0 + t * 0.15) - 0.5) - 0.46);
+        let g = max(rim * mix(0.35, 1.0, reveal), scan * 0.05 * select(1.0, 0.0, roof));
+        if (g < 0.01) {
+            discard;
+        }
+        var grgb = health * g * 1.4;
+        if (suspect && params.b.w < 0.5) {
+            grgb = grgb * (0.6 + 0.8 * step(0.5, fract(t * 1.7)));
+        }
+        let gd = distance(in.world, view.world_position);
+        let gfog = 1.0 - smoothstep(params.b.x, params.b.y, gd);
+        return vec4<f32>(grgb * gfog, 1.0);
+    }
+
     // An open tower (we are inside it) keeps only its outline, and so does
     // anything standing between the eye and what is chosen: a cutaway.
     let eye_d = distance(in.world, view.world_position);
     let cut = params.c.y > 0.0 && eye_d < params.c.y && !chosen;
-    if ((open || cut) && rim < 0.05) {
+    // Cut-away towers keep a hairline, so they never crowd the view.
+    let hair = 1.0 - smoothstep(0.0, 0.004 + fw * 1.2, edge);
+    if ((open && rim < 0.05) || (cut && hair < 0.05)) {
         discard;
     }
 
@@ -160,10 +184,23 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if (open) {
         rim_b = 0.5;
     }
-    if (cut) {
-        rim_b = 0.12;
-    }
     rgb = mix(rgb, health * rim_b * 1.6, rim);
+    if (cut) {
+        rgb = health * 0.18 * hair;
+    }
+
+    // Suspicion: the Wall's magenta, in horizontal tears that jump and
+    // flicker across the faces, and a burning outline. Seen from anywhere.
+    if (suspect) {
+        let magenta = vec3<f32>(1.0, 0.024, 0.66);
+        let frame = select(floor(t * 7.0), 3.0, params.b.w > 0.5);
+        let band = floor(in.world.y * 3.0 + hc * 0.0);
+        let tear = step(0.78, fract(sin((band + frame * 13.1) * 91.7) * 43758.5));
+        let shifted = fract(g.x + tear * 0.37) - 0.5;
+        let cellm = 1.0 - smoothstep(r - gw * 0.5, r + gw * 0.5, length(vec2<f32>(shifted, f.y)));
+        rgb = mix(rgb, magenta * (0.25 + cellm * 1.4), tear * 0.85);
+        rgb = mix(rgb, magenta * (1.2 + 0.8 * step(0.5, fract(t * 1.1))), rim);
+    }
     if (params.b.z > 0.5 && !is_issue) {
         rgb = rgb * 0.15;
     }

@@ -21,8 +21,10 @@ pub struct WallParams {
     pub head: Vec4,
     /// x: pressure, y: time, z: glitch on, w: intensity.
     pub state: Vec4,
-    /// x: fall-speed boost (jack-in), y: wall height.
+    /// x: fall-speed boost (arrival), y: wall height, z: gate count.
     pub extra: Vec4,
+    /// Gate openings: (x, z, half width, height).
+    pub gates: [Vec4; 24],
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
@@ -40,6 +42,7 @@ impl Default for WallMaterial {
                 head: palette::linear4(palette::WALL_HEAD, 1.0),
                 state: Vec4::new(0.0, 0.0, 1.0, 1.0),
                 extra: Vec4::new(1.0, 34.0, 0.0, 0.0),
+                gates: [Vec4::ZERO; 24],
             },
         }
     }
@@ -52,5 +55,16 @@ impl Material for WallMaterial {
 
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Add
+    }
+
+    fn specialize(
+        _: &bevy::pbr::MaterialPipeline,
+        descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
+        _: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _: bevy::pbr::MaterialPipelineKey<Self>,
+    ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
+        // Seen from inside and out.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
 }

@@ -1,5 +1,6 @@
-// The Blackwall: a curtain of falling rain made of square dots, after the
-// Blackwall in Cyberpunk 2077 and the rain of the Matrix. Each lane carries
+// The Blackwall: the firewall, a curtain of falling rain round the whole
+// map, made of square dots after the Blackwall in Cyberpunk 2077 and the
+// rain of the Matrix. Open ports are gates: holes where the rain parts. Each lane carries
 // trails led by a white-hot head and fading into black. Kernel pressure adds
 // lanes, lengthens and speeds the trails, and burns them from magenta to red;
 // above ~65% the rain tears sideways. Additive, so the kernel's districts
@@ -14,8 +15,10 @@ struct WallParams {
     head: vec4<f32>,
     // x: pressure 0..1, y: time (s), z: glitch enabled (0/1), w: intensity
     state: vec4<f32>,
-    // x: fall-speed boost (jack-in), y: wall height (world units)
+    // x: fall-speed boost (arrival), y: wall height (world units), z: gate count
     extra: vec4<f32>,
+    // Openings where ports pass through: (x, z, half width, height).
+    gates: array<vec4<f32>, 24>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: WallParams;
@@ -35,8 +38,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let boost = params.extra.x;
     let height = params.extra.y;
 
-    var x = in.world_position.x;
+    // Along the wall: the walls run along x or z, so their sum works for all four.
+    var x = in.world_position.x + in.world_position.z;
     let y = in.world_position.y;
+
+    // The rain parts at each gate: an open port is a hole in the Wall.
+    let n = i32(params.extra.z);
+    for (var i = 0; i < 24; i = i + 1) {
+        if (i >= n) {
+            break;
+        }
+        let g = params.gates[i];
+        let d = length(in.world_position.xz - g.xy);
+        if (d < g.z && y < g.w) {
+            discard;
+        }
+    }
 
     // Tearing: horizontal slices jump sideways under high pressure.
     let slice = floor(y * 1.5 + floor(t * 10.0) * 3.1);

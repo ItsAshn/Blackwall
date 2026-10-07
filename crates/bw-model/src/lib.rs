@@ -212,6 +212,8 @@ pub struct Snapshot {
     pub processes: BTreeMap<ProcKey, Process>,
     pub volumes: Vec<Volume>,
     pub interfaces: Vec<Interface>,
+    /// Listening ports, connections and the firewall: the Blackwall.
+    pub net: NetState,
 }
 
 /// The change between two snapshots. Sources send one full [`Snapshot`]
@@ -225,6 +227,7 @@ pub struct Delta {
     pub removed: Vec<ProcKey>,
     pub volumes: Vec<Volume>,
     pub interfaces: Vec<Interface>,
+    pub net: NetState,
 }
 
 impl Delta {
@@ -249,6 +252,7 @@ impl Delta {
             removed,
             volumes: new.volumes.clone(),
             interfaces: new.interfaces.clone(),
+            net: new.net.clone(),
         }
     }
 }
@@ -266,6 +270,13 @@ impl Snapshot {
         }
         self.volumes = delta.volumes.clone();
         self.interfaces = delta.interfaces.clone();
+        // The firewall's rules arrive separately (they may need elevation):
+        // keep what we know unless the delta brings something new.
+        let fw = std::mem::take(&mut self.net.firewall);
+        self.net = delta.net.clone();
+        if self.net.firewall.status == FirewallStatus::Unknown {
+            self.net.firewall = fw;
+        }
     }
 
     /// Children of each process, sorted by key for a stable layout.
@@ -363,6 +374,173 @@ pub struct ProcessDetail {
     pub restricted: bool,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub enum Proto {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Proto {
+    pub fn label(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
+}
+
+/// A port something is listening on: a gate in the Wall.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Listener {
+    pub proto: Proto,
+    pub port: u16,
+    /// The address it is bound to ("0.0.0.0", "::", "127.0.0.1"…).
+    pub addr: String,
+    /// Reachable from other machines (bound to all or a non-loopback address).
+    pub exposed: bool,
+    /// The owning process, when the OS lets us see it.
+    pub process: Option<ProcKey>,
+}
+
+/// An established connection: a stream crossing the Wall.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Connection {
+    pub proto: Proto,
+    pub local_port: u16,
+    pub remote_addr: String,
+    pub remote_port: u16,
+    /// We opened it (the local port is not one we listen on).
+    pub outbound: bool,
+    pub process: Option<ProcKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirewallAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirewallStatus {
+    /// Rules not read (they need admin rights, or no firewall tool was found).
+    #[default]
+    Unknown,
+    /// A firewall exists but is not filtering.
+    Inactive,
+    Active,
+}
+
+/// One inbound rule, reduced to what the Wall can show.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FirewallRule {
+    /// `None`: any port.
+    pub port: Option<u16>,
+    pub proto: Option<Proto>,
+    pub action: FirewallAction,
+    /// The rule as the tool printed it.
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Firewall {
+    pub status: FirewallStatus,
+    /// "ufw", "nftables", "firewalld", "Windows Defender Firewall"…
+    pub backend: String,
+    /// What happens to inbound traffic no rule matches.
+    pub inbound_default: Option<FirewallAction>,
+    pub rules: Vec<FirewallRule>,
+}
+
+impl Firewall {
+    /// What the firewall does with inbound traffic to `port`, if known.
+    pub fn verdict(&self, port: u16, proto: Proto) -> Option<FirewallAction> {
+        match self.status {
+            FirewallStatus::Unknown => None,
+            FirewallStatus::Inactive => Some(FirewallAction::Allow),
+            FirewallStatus::Active => self
+                .rules
+                .iter()
+                .find(|r| r.port.is_none_or(|p| p == port) && r.proto.is_none_or(|p| p == proto))
+                .map(|r| r.action)
+                .or(self.inbound_default),
+        }
+    }
+}
+
+/// The network as the Wall shows it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetState {
+    pub listening: Vec<Listener>,
+    pub connections: Vec<Connection>,
+    pub firewall: Firewall,
+}
+
+/// Where a service is defined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ServiceKind {
+    /// A system service unit (systemd, launchd daemon, Windows service).
+    SystemUnit,
+    /// A per-user service unit.
+    UserUnit,
+    /// A Docker or Podman container.
+    Container,
+    /// A project folder that defines services (compose file, Procfile…).
+    Project,
+    /// Started at login.
+    Autostart,
+    /// A scheduled job (cron, timer).
+    Scheduled,
+}
+
+impl ServiceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ServiceKind::SystemUnit => "system service",
+            ServiceKind::UserUnit => "user service",
+            ServiceKind::Container => "container",
+            ServiceKind::Project => "project",
+            ServiceKind::Autostart => "autostart",
+            ServiceKind::Scheduled => "scheduled job",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceState {
+    Running,
+    /// Defined (and perhaps enabled) but not running.
+    Idle,
+    Failed,
+}
+
+/// A service defined on this machine, running or not.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Service {
+    pub kind: ServiceKind,
+    pub name: String,
+    /// Unit file, container id, project folder, desktop file…
+    pub location: String,
+    pub state: ServiceState,
+    /// Starts by itself (enabled unit, autostart entry, restart policy).
+    pub enabled: bool,
+    /// When it last ran (seconds since the Unix epoch), if anything recorded it.
+    pub last_active: Option<u64>,
+    /// When its definition last changed (seconds since the Unix epoch).
+    pub changed: Option<u64>,
+}
+
+impl Service {
+    /// Seconds since it last ran (or since it was last touched), as of `now`.
+    pub fn idle_secs(&self, now: u64) -> Option<u64> {
+        self.last_active
+            .or(self.changed)
+            .map(|t| now.saturating_sub(t))
+    }
+}
+
 /// Message stream from a source to its consumers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Update {
@@ -370,6 +548,17 @@ pub enum Update {
     Delta(Box<Delta>),
     /// Internals of the process currently being explored.
     Detail(Box<ProcessDetail>),
+    /// Services defined on the machine (collected every minute or so).
+    Services(Vec<Service>),
+    /// Firewall rules, read on request (may need elevation).
+    Firewall(Box<Firewall>),
+}
+
+/// Requests from the viewer to its source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    /// Read the firewall's rules, asking for admin rights if needed.
+    FirewallRules,
 }
 
 #[cfg(test)]

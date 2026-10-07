@@ -60,6 +60,7 @@ const KIND_BEACON: f32 = 8.0;
 const KIND_CABLE: f32 = 9.0;
 const KIND_LEDGE: f32 = 10.0;
 const KIND_STRATUM: f32 = 11.0;
+const KIND_GATE: f32 = 12.0;
 
 fn hash11(x: f32) -> f32 {
     return fract(sin(x * 127.1 + 3.7) * 43758.5453);
@@ -160,6 +161,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
                 b = 0.1;
             } else if (is_kind(kind, KIND_STRATUM)) {
                 b = 0.42;
+            } else if (is_kind(kind, KIND_GATE)) {
+                // A port's gate: steady light; a suspicious one flickers.
+                b = 1.1;
+                if (uv.x > 0.5 && !reduced) {
+                    b = b * (0.6 + 0.9 * step(0.4, hash11(floor(t * 9.0) + id)));
+                }
             } else if (is_kind(kind, KIND_BEACON)) {
                 // An issue's beam: bright, climbing, fading as it rises.
                 let crit = uv.x;

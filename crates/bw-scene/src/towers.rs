@@ -38,11 +38,17 @@ const USER: f32 = 0.0;
 const KERNEL: f32 = 1.0;
 /// The kernel's own memory: one heavy slab.
 const KERNEL_MEMORY: f32 = 2.0;
+/// A dormant service: a hollow ghost.
+const GHOST: f32 = 3.0;
 /// Added to the realm code while a tower dissolves.
 const DYING: f32 = 10.0;
+/// Added to the realm code for a suspicious process.
+const SUSPECT: f32 = 50.0;
 
 /// Ids for blocks (not processes), above any column index.
 pub(crate) const BLOCK_ID_BASE: usize = 2_000_000;
+/// Ids for dormant-service ghosts.
+pub(crate) const GHOST_ID_BASE: usize = 2_500_000;
 const DISSOLVE_SECS: f32 = 1.2;
 
 #[derive(ShaderType, Clone, Debug, Default)]
@@ -248,6 +254,7 @@ fn rebuild(
     time: Res<Time>,
     jack: Res<JackIn>,
     settings: Res<SceneSettings>,
+    sus: Res<Suspicions>,
     handles: Res<TowerHandles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut born: Local<HashMap<ProcKey, f32>>,
@@ -289,6 +296,7 @@ fn rebuild(
             now
         });
         let rgb = crate::city::health_color(p.health(), c.realm);
+        let suspect = sus.is_suspect(c.key);
         // A plot holds one block per 128 MB: a big process is a crowded
         // cluster you can count, a small one a single tower.
         for (min, max, h) in blocks(c, p.mem_bytes) {
@@ -301,7 +309,7 @@ fn rebuild(
                     KERNEL
                 } else {
                     USER
-                },
+                } + if suspect { SUSPECT } else { 0.0 },
                 rgb,
                 cpu: (p.cpu_pct / 100.0).clamp(0.0, 1.0),
                 time: b,
@@ -326,6 +334,29 @@ fn rebuild(
             rgb: g.rgb,
             cpu: 0.0,
             time: g.died,
+        });
+    }
+    // The dormant district: hollow ghosts, taller the longer they idle.
+    let now_s = m.now();
+    for (i, sv) in crate::blackwall::ghosts(&m).iter().enumerate() {
+        let (a, b) = crate::blackwall::ghost_plot(lay, i);
+        let suspect = sus.of_service(&sv.location).next().is_some();
+        let rgb = if suspect {
+            linear(palette::WALL_CALM)
+        } else if sv.state == bw_model::ServiceState::Failed {
+            linear(palette::HEALTH_ISSUE)
+        } else {
+            linear(palette::SIGNAL_DIM)
+        };
+        bm.tower(&Spec {
+            min: a,
+            max: b,
+            h: crate::blackwall::ghost_height(sv.idle_secs(now_s)),
+            id: (GHOST_ID_BASE + i) as f32,
+            realm: GHOST + if suspect { SUSPECT } else { 0.0 },
+            rgb,
+            cpu: 0.0,
+            time: if first { start } else { 0.0 },
         });
     }
     // The kernel's own memory: a low, heavy slab.
@@ -358,6 +389,7 @@ fn update_params(
     cam: Res<crate::camera::OrbitCam>,
     ex: Res<crate::explore::Explore>,
     handles: Res<TowerHandles>,
+    marks: Res<Landmarks>,
     mut mats: ResMut<Assets<TowerMaterial>>,
 ) {
     let id = |k: Option<ProcKey>| {
@@ -372,7 +404,11 @@ fn update_params(
     } else {
         time.elapsed_secs()
     };
-    mat.params.a = Vec4::new(t, id(sel.key), id(sel.hovered), id(ex.inside()));
+    let hovered = marks
+        .hovered
+        .and_then(|i| marks.list.get(i))
+        .map_or(id(sel.hovered), |l| l.shader_id);
+    mat.params.a = Vec4::new(t, id(sel.key), hovered, id(ex.inside()));
     let (fs, fe) = crate::camera::fog(&cam);
     mat.params.b = Vec4::new(
         fs,

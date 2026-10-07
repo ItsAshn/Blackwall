@@ -3,9 +3,9 @@
 
 mod demo;
 
-pub use demo::DemoWorld;
+pub use demo::{DemoWorld, demo_firewall, demo_services};
 
-use bw_model::{Delta, ProcKey, Snapshot, Update};
+use bw_model::{Delta, ProcKey, Request, Snapshot, Update};
 use bw_platform::{Collector, SysCollector};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::time::Duration;
@@ -24,13 +24,20 @@ pub enum SourceKind {
 pub struct SourceHandle {
     pub updates: Receiver<Update>,
     pub focus: Sender<Option<ProcKey>>,
+    /// Requests that may take a while (firewall rules through an admin prompt).
+    pub requests: Sender<Request>,
 }
+
+/// How often the service sweep runs.
+const SWEEP: Duration = Duration::from_secs(60);
 
 /// Start a source on a background thread. The thread stops when the update
 /// receiver is dropped.
 pub fn spawn(kind: SourceKind, interval: Duration) -> SourceHandle {
     let (tx, rx) = bounded(8);
     let (focus_tx, focus_rx) = unbounded();
+    let (req_tx, req_rx) = unbounded();
+    let side = tx.clone();
     std::thread::Builder::new()
         .name(format!("bw-source-{kind:?}").to_lowercase())
         .spawn(move || match kind {
@@ -38,9 +45,54 @@ pub fn spawn(kind: SourceKind, interval: Duration) -> SourceHandle {
             SourceKind::Demo => run(DemoWorld::new(0xB1AC_3A11), tx, focus_rx, interval),
         })
         .expect("spawn source thread");
+    std::thread::Builder::new()
+        .name("bw-source-services".into())
+        .spawn(move || slow(kind, side, req_rx))
+        .expect("spawn services thread");
     SourceHandle {
         updates: rx,
         focus: focus_tx,
+        requests: req_tx,
+    }
+}
+
+/// The slow side: services every minute, the firewall at start (what an
+/// ordinary user may read) and on request (with an admin prompt).
+fn slow(kind: SourceKind, tx: Sender<Update>, requests: Receiver<Request>) {
+    // The demo's clock starts where its snapshots do.
+    let demo_now = 1_760_000_000 + 90_000;
+    if kind == SourceKind::Live
+        && let Some(fw) = bw_platform::read_firewall(false)
+        && tx.send(Update::Firewall(Box::new(fw))).is_err()
+    {
+        return;
+    }
+    loop {
+        let services = match kind {
+            SourceKind::Live => bw_platform::sweep_services(),
+            SourceKind::Demo => demo_services(demo_now),
+        };
+        if tx.send(Update::Services(services)).is_err() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + SWEEP;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match requests.recv_timeout(left) {
+                Ok(Request::FirewallRules) => {
+                    let fw = match kind {
+                        SourceKind::Live => bw_platform::read_firewall(true),
+                        SourceKind::Demo => Some(demo_firewall()),
+                    };
+                    if let Some(fw) = fw
+                        && tx.send(Update::Firewall(Box::new(fw))).is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 }
 

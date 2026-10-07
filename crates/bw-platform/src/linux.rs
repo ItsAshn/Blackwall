@@ -6,7 +6,24 @@ use bw_model::{
 use sysinfo::{Process, ThreadKind};
 
 #[derive(Default)]
-pub struct State;
+pub struct State {
+    net: crate::linux_net::NetCache,
+}
+
+pub fn net(
+    state: &mut State,
+    keys: &std::collections::HashMap<u32, bw_model::ProcKey>,
+) -> bw_model::NetState {
+    crate::linux_net::net(&mut state.net, keys)
+}
+
+pub fn services() -> Vec<bw_model::Service> {
+    crate::linux_services::services()
+}
+
+pub fn firewall(elevate: bool) -> Option<bw_model::Firewall> {
+    crate::linux_net::firewall(elevate)
+}
 
 impl State {
     /// Pressure Stall Information: the share of time tasks were stalled on
@@ -38,7 +55,7 @@ pub fn capabilities() -> Capabilities {
     Capabilities {
         kernel_threads: true,
         process_io: true,
-        per_proc_net: false,
+        per_proc_net: true,
         load_average: true,
         pressure_stall: std::path::Path::new("/proc/pressure/cpu").exists(),
         process_detail: true,

@@ -30,6 +30,27 @@ mod os;
 #[path = "fallback.rs"]
 mod os;
 
+#[cfg(target_os = "linux")]
+mod linux_net;
+#[cfg(target_os = "linux")]
+mod linux_services;
+pub mod services;
+
+/// Every service defined on the machine, running or not: the OS's own
+/// units plus containers and project folders. Slow (it runs commands and
+/// walks the home folder); call it every minute or so, off the UI thread.
+pub fn sweep_services() -> Vec<bw_model::Service> {
+    let mut v = os::services();
+    v.extend(services::common());
+    v
+}
+
+/// The firewall's rules. Without `elevate`, only what an ordinary user may
+/// read; with it, the OS's own admin prompt may appear.
+pub fn read_firewall(elevate: bool) -> Option<bw_model::Firewall> {
+    os::firewall(elevate)
+}
+
 /// Something that can produce full snapshots of the local machine.
 pub trait Collector: Send {
     fn capabilities(&self) -> Capabilities;
@@ -91,7 +112,7 @@ impl SysCollector {
             users: Users::new_with_refreshed_list(),
             host,
             my_uid,
-            os: os::State,
+            os: os::State::default(),
             detail_ticks: (None, HashMap::new(), None),
         }
     }
@@ -298,6 +319,8 @@ impl Collector for SysCollector {
             .collect();
         interfaces.sort_by(|a, b| a.name.cmp(&b.name));
 
+        let keys: HashMap<u32, ProcKey> = processes.keys().map(|k| (k.pid, *k)).collect();
+        let net = os::net(&mut self.os, &keys);
         Snapshot {
             time_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -309,6 +332,7 @@ impl Collector for SysCollector {
             processes,
             volumes,
             interfaces,
+            net,
         }
     }
 }

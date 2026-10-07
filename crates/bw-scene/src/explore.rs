@@ -193,9 +193,18 @@ fn explore_input(
     mut sel: ResMut<Selection>,
     mut cam: ResMut<OrbitCam>,
     sl: Res<SceneLayout>,
+    sus: Res<Suspicions>,
+    requests: Res<SourceRequests>,
 ) {
     if block.keyboard {
         return;
+    }
+    // F: read the firewall's rules (the OS may ask for admin rights).
+    if keys.just_pressed(KeyCode::KeyF)
+        && let Some(tx) = &requests.0
+    {
+        info!("requesting firewall rules");
+        let _ = tx.send(bw_model::Request::FirewallRules);
     }
     let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
     match ex.level {
@@ -203,16 +212,24 @@ fn explore_input(
             if enter && let Some(k) = sel.key {
                 ex.dive(k);
             }
-            // N: the next tower with an issue, worst first.
+            // N: the next thing that needs attention: suspicious processes
+            // first (most suspicious first), then issues, worst first.
             if keys.just_pressed(KeyCode::KeyN) {
+                let mut keys: Vec<ProcKey> = crate::suspect::by_target(&sus.list)
+                    .into_iter()
+                    .filter_map(|(t, _)| match t {
+                        crate::suspect::Target::Process(k) => Some(k),
+                        _ => None,
+                    })
+                    .collect();
                 let mut flagged: Vec<&bw_model::Process> = m
                     .snapshot
                     .processes
                     .values()
-                    .filter(|p| p.health() != Health::Healthy)
+                    .filter(|p| p.health() != Health::Healthy && !keys.contains(&p.key))
                     .collect();
                 flagged.sort_by(|a, b| b.health().cmp(&a.health()).then(a.key.cmp(&b.key)));
-                let keys: Vec<ProcKey> = flagged.iter().map(|p| p.key).collect();
+                keys.extend(flagged.iter().map(|p| p.key));
                 let next = match sel.key.and_then(|k| keys.iter().position(|x| *x == k)) {
                     Some(i) => keys.get((i + 1) % keys.len()).copied(),
                     None => keys.first().copied(),

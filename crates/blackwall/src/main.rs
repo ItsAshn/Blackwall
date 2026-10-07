@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra]
-//!           [--size WxH] [--select NAME] [--dive NAME [--find]] [--hide-ui] [--no-intro]
+//!           [--size WxH] [--select NAME] [--dive NAME [--find]] [--firewall]
+//!           [--hide-ui] [--no-intro]
 //!           [--screenshot PATH [--after SECONDS]]
 //! ```
 
@@ -26,13 +27,14 @@ struct Args {
     no_intro: bool,
     dive: Option<String>,
     find: bool,
+    firewall: bool,
     screenshot: Option<String>,
     after: f32,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--dive NAME [--find]] [--hide-ui] [--no-intro]\n                 [--screenshot PATH [--after SECONDS]]"
+        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--dive NAME [--find]] [--firewall] [--hide-ui] [--no-intro]\n                 [--screenshot PATH [--after SECONDS]]"
     );
     std::process::exit(2)
 }
@@ -48,6 +50,7 @@ fn parse_args() -> Args {
         no_intro: false,
         dive: None,
         find: false,
+        firewall: false,
         screenshot: None,
         after: 8.0,
     };
@@ -73,6 +76,7 @@ fn parse_args() -> Args {
             "--no-intro" => a.no_intro = true,
             "--dive" => a.dive = Some(val()),
             "--find" => a.find = true,
+            "--firewall" => a.firewall = true,
             "--screenshot" => a.screenshot = Some(val()),
             "--after" => a.after = val().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
@@ -116,6 +120,11 @@ fn main() -> AppExit {
     .insert_resource(bw_scene::camera::JackIn::new(!args.no_intro))
     .insert_resource(LaunchArgs(args.clone()));
     app.insert_resource(bw_scene::explore::SourceFocus(Some(source.focus)));
+    if args.firewall {
+        // Read the firewall's rules at once (the OS may ask for admin rights).
+        let _ = source.requests.send(bw_model::Request::FirewallRules);
+    }
+    app.insert_resource(bw_scene::SourceRequests(Some(source.requests)));
 
     if args.select.is_some() || args.dive.is_some() {
         app.add_systems(Update, preselect);

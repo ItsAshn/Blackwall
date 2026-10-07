@@ -41,3 +41,22 @@ pub fn detail(
 ) -> Option<bw_model::ProcessDetail> {
     None
 }
+
+/// Ports and connections per process are Linux-only for now (Milestone 6:
+/// GetExtendedTcpTable on Windows, proc_pidfdinfo on macOS).
+pub fn net(
+    _state: &mut State,
+    _keys: &std::collections::HashMap<u32, bw_model::ProcKey>,
+) -> bw_model::NetState {
+    bw_model::NetState::default()
+}
+
+/// OS service units (launchd, Windows services) come later; containers and
+/// project folders are found on every OS (see `services.rs`).
+pub fn services() -> Vec<bw_model::Service> {
+    vec![]
+}
+
+pub fn firewall(_elevate: bool) -> Option<bw_model::Firewall> {
+    None
+}

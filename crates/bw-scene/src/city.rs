@@ -116,6 +116,7 @@ const KIND_BEACON: f32 = 8.0;
 const KIND_CABLE: f32 = 9.0;
 const KIND_LEDGE: f32 = 10.0;
 const KIND_STRATUM: f32 = 11.0;
+const KIND_GATE: f32 = 12.0;
 
 /// How high issue beacons climb: well above the tallest tower, so a problem
 /// can be seen from anywhere in the city.
@@ -227,6 +228,19 @@ fn setup(
 pub(crate) fn beacon(m: &mut DotMesh, id: usize, from: Vec3, rise: f32, health: Health, time: f32) {
     let rgb = health_color(health, Realm::User);
     let crit = if health == Health::Critical { 1.0 } else { 0.0 };
+    beacon_rgb(m, id, from, rise, rgb, crit, time);
+}
+
+/// A beacon in any color; `crit` 0..1 sets how hard it burns.
+pub(crate) fn beacon_rgb(
+    m: &mut DotMesh,
+    id: usize,
+    from: Vec3,
+    rise: f32,
+    rgb: [f32; 3],
+    crit: f32,
+    time: f32,
+) {
     let n = (rise / 0.09) as usize;
     for i in 0..n {
         let u = i as f32 / n as f32;
@@ -255,6 +269,26 @@ pub(crate) fn cable(m: &mut DotMesh, id: usize, a: Vec3, b: Vec3, rgb: [f32; 3],
             0.022,
             [pulses, u],
             [id as f32, KIND_CABLE],
+            [rgb[0], rgb[1], rgb[2], time],
+        );
+    }
+}
+
+/// An arch of flowing dots from `a` to `b` (a connection crossing the Wall),
+/// pulses running from a to b.
+pub(crate) fn arc(m: &mut DotMesh, id: usize, a: Vec3, b: Vec3, rgb: [f32; 3], time: f32) {
+    let len = a.distance(b);
+    let lift = 0.18 * len + 0.5;
+    let n = (len / 0.12).max(2.0) as usize;
+    let pulses = (len / 2.0).max(1.0);
+    for i in 0..=n {
+        let u = i as f32 / n as f32;
+        let p = a.lerp(b, u) + Vec3::Y * lift * 4.0 * u * (1.0 - u);
+        m.dot(
+            p,
+            0.022,
+            [pulses, u],
+            [id as f32, KIND_FLOW],
             [rgb[0], rgb[1], rgb[2], time],
         );
     }
@@ -293,6 +327,7 @@ fn rebuild_city(
     jack: Res<JackIn>,
     handles: Res<CityHandles>,
     settings: Res<SceneSettings>,
+    sus: Res<Suspicions>,
     mut born: ResMut<Born>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_gen: Local<u64>,
@@ -311,6 +346,7 @@ fn rebuild_city(
     born.0.retain(|k, _| m.snapshot.processes.contains_key(k));
 
     let lay = &sl.layout;
+    let magenta = linear(palette::WALL_CALM);
     let mut dm = DotMesh::default();
     for (id, c) in lay.columns.iter().enumerate() {
         let Some(p) = m.snapshot.processes.get(&c.key) else {
@@ -322,7 +358,10 @@ fn rebuild_city(
             .or_insert(if first { start } else { now });
         let health = p.health();
         let rgb = health_color(health, c.realm);
-        if health != Health::Healthy {
+        if sus.is_suspect(c.key) {
+            // Suspicion burns in the Wall's magenta: it is a security matter.
+            beacon_rgb(&mut dm, id, c.top(), BEACON_RISE * 1.2, magenta, 1.0, b);
+        } else if health != Health::Healthy {
             beacon(&mut dm, id, c.top(), BEACON_RISE, health, b);
         }
         // Family: a cable from the parent's roof to the child's.
@@ -358,6 +397,123 @@ fn rebuild_city(
             ];
             let rate = ((io / 4096.0).max(1.0).log10() / 4.0).clamp(0.0, 1.0);
             conduit(&mut dm, id, &path, rate, rgb, b);
+        }
+    }
+    // The Wall's gates: a frame of light for every listening port, joined
+    // to its tower by a conduit along the floor.
+    let w = crate::blackwall::wall_half(lay, crate::blackwall::ghosts(&m).len());
+    let ok = health_color(Health::Healthy, Realm::User);
+    let issue = health_color(Health::Critical, Realm::User);
+    let dim = linear(palette::SIGNAL_DIM);
+    for (gi, l) in m.snapshot.net.listening.iter().enumerate() {
+        use crate::blackwall::GateLook;
+        let (p, out) = crate::blackwall::gate(w, l);
+        let look = crate::blackwall::gate_look(&m, l);
+        let (hw, gh) = crate::blackwall::gate_size(look);
+        let suspect = l.process.is_some_and(|k| sus.is_suspect(k));
+        let rgb = if suspect {
+            magenta
+        } else {
+            match look {
+                GateLook::Open => ok,
+                GateLook::Barred => issue,
+                GateLook::Unknown => magenta.map(|c| c * 0.55),
+                GateLook::Local => dim,
+            }
+        };
+        let side = Vec3::new(-out.z, 0.0, out.x);
+        let base = p + out * 0.06;
+        let id = (crate::towers::BLOCK_ID_BASE + 1000 + gi) as f32;
+        let col = [rgb[0], rgb[1], rgb[2], 0.0];
+        let frame = [
+            base - side * hw,
+            base - side * hw + Vec3::Y * gh,
+            base + side * hw + Vec3::Y * gh,
+            base + side * hw,
+        ];
+        interior::along(&frame, 0.07, |q, u| {
+            dm.dot(
+                q,
+                0.03,
+                [if suspect { 1.0 } else { 0.0 }, u],
+                [id, KIND_GATE],
+                col,
+            )
+        });
+        if look == GateLook::Barred {
+            let mut y = 0.4;
+            while y < gh {
+                let bar = [
+                    base - side * hw + Vec3::Y * y,
+                    base + side * hw + Vec3::Y * y,
+                ];
+                interior::along(&bar, 0.09, |q, u| {
+                    dm.dot(q, 0.025, [0.0, u], [id, KIND_GATE], col)
+                });
+                y += 0.45;
+            }
+        }
+        if settings.show_streams
+            && let Some(c) = l.process.and_then(|k| lay.column(&k))
+        {
+            let inbound = m
+                .snapshot
+                .net
+                .connections
+                .iter()
+                .filter(|x| !x.outbound && x.local_port == l.port)
+                .count() as f32;
+            let foot = p - out * 0.3 + Vec3::Y * 0.04;
+            let start = Vec3::new(c.base().x, 0.04, c.base().z);
+            let corner = if out.x.abs() > 0.5 {
+                Vec3::new(start.x, 0.04, foot.z)
+            } else {
+                Vec3::new(foot.x, 0.04, start.z)
+            };
+            conduit(
+                &mut dm,
+                gi,
+                &[foot, corner, start],
+                (inbound / 4.0).min(1.0),
+                rgb,
+                0.0,
+            );
+        }
+    }
+    // Connections: arcs from the tower over the Wall to the far end, in
+    // the dark beyond. Inbound ones flow toward the tower.
+    if settings.show_streams {
+        for c in &m.snapshot.net.connections {
+            let Some((ci, col)) = c
+                .process
+                .and_then(|k| lay.column_index(&k).map(|i| (i, &lay.columns[i])))
+            else {
+                continue;
+            };
+            let r = crate::blackwall::remote_point(w, &c.remote_addr);
+            let suspect = c.process.is_some_and(|k| sus.is_suspect(k));
+            let rgb = if suspect {
+                magenta
+            } else {
+                ok.map(|v| v * 0.6)
+            };
+            let top = col.top();
+            if c.outbound {
+                arc(&mut dm, ci, top, r, rgb, 0.0);
+            } else {
+                arc(&mut dm, ci, r, top, rgb, 0.0);
+            }
+            // The far end: a small knot of light.
+            for k in 0..6 {
+                let a = k as f32 / 6.0 * std::f32::consts::TAU;
+                dm.dot(
+                    r + Vec3::new(a.cos(), 0.0, a.sin()) * 0.18,
+                    0.03,
+                    [if suspect { 1.0 } else { 0.0 }, 0.5],
+                    [-7.0, KIND_GATE],
+                    [rgb[0], rgb[1], rgb[2], 0.0],
+                );
+            }
         }
     }
     // Volumes: dense 3×3 columns outside the RAM square; lit dots are used

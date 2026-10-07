@@ -133,6 +133,8 @@ fn hud(
     nodes: Query<(&ProcNode, &Shown)>,
     ents: Res<ProcEntities>,
     mut ex: ResMut<bw_scene::explore::Explore>,
+    sus: Res<bw_scene::Suspicions>,
+    marks: Res<bw_scene::Landmarks>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     if !ui_state.styled {
@@ -204,6 +206,7 @@ fn hud(
         ui_state.bottom_h = bottom_bar(&mut root, &m, &settings, &floor);
     } else {
         quiet::breadcrumb(ctx, &m, &sel, &ex);
+        quiet::verdict(ctx, &m, &sus);
     }
     if ui_state.show_list {
         if ui_state.left_w > 0.0 {
@@ -239,7 +242,8 @@ fn hud(
         draw_labels!(&root);
     }
     if let Some((camera, cam_tf)) = cam {
-        quiet::whisper(ctx, camera, cam_tf, &m, &sel, &ex, &sl);
+        quiet::whisper(ctx, camera, cam_tf, &m, &sel, &ex, &sl, &sus);
+        quiet::landmark(ctx, camera, cam_tf, &marks);
         quiet::compass(ctx, camera, cam_tf, &ex);
     }
     if !ui_state.show_vitals {
@@ -772,6 +776,7 @@ fn world_labels(
         let (offset, color) = match label.kind {
             LabelKind::Subsystem => (Vec3::new(0.0, 0.6, 0.0), KERNEL),
             LabelKind::Volume => (Vec3::new(0.0, 0.5, 0.0), SIGNAL_DIM),
+            LabelKind::Alert => (Vec3::new(0.0, 0.5, 0.0), WALL_CALM),
         };
         if let Some(p) = project(tf.translation() + offset) {
             let galley = painter.layout_no_wrap(label.text.clone(), font.clone(), color);
@@ -810,7 +815,11 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                         ("Zoom out · Esc", "close it, then clear the choice"),
                         ("↑↓ / ←→ inside", "floors and slabs / pipes"),
                         ("Tab", "cycle the busiest processes"),
-                        ("N", "next issue; inside: next anomaly"),
+                        (
+                            "N",
+                            "next suspicious process or issue; inside: next anomaly",
+                        ),
+                        ("F", "read the firewall's rules (may ask for admin)"),
                         ("Home", "the whole map"),
                         ("/  or  Ctrl/⌘+K", "search"),
                         ("I · L · H", "inspector · process list · hide HUD"),

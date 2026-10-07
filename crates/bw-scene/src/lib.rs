@@ -4,6 +4,7 @@
 //! Engine-specific code lives only here and in `bw-ui` (PLAN §4.1). The scene
 //! consumes [`bw_model::Update`]s from any source through [`SourceRx`].
 
+mod blackwall;
 pub mod camera;
 mod city;
 pub mod explore;
@@ -12,6 +13,7 @@ pub mod layout;
 pub mod palette;
 mod pick;
 pub mod quality;
+pub mod suspect;
 mod towers;
 mod visuals;
 mod wall;
@@ -49,7 +51,82 @@ pub struct Machine {
     /// Keys born / died in the last update, for materialize/dissolve effects.
     pub born: Vec<ProcKey>,
     pub died: Vec<ProcKey>,
+    /// Services defined on the machine (running or not), and a counter
+    /// bumped when they arrive.
+    pub services: Vec<bw_model::Service>,
+    pub services_gen: u64,
 }
+
+impl Machine {
+    /// Seconds since the Unix epoch, by the source's clock.
+    pub fn now(&self) -> u64 {
+        self.snapshot.time_ms / 1000
+    }
+
+    /// Services that are not running, longest idle first: the dormant ones.
+    pub fn dormant(&self) -> Vec<&bw_model::Service> {
+        let now = self.now();
+        let mut v: Vec<&bw_model::Service> = self
+            .services
+            .iter()
+            .filter(|s| s.state != bw_model::ServiceState::Running)
+            .collect();
+        v.sort_by_key(|s| std::cmp::Reverse(s.idle_secs(now).unwrap_or(0)));
+        v
+    }
+}
+
+/// Suspicious behaviour found by the rules in [`suspect`].
+#[derive(Resource, Default)]
+pub struct Suspicions {
+    pub list: Vec<suspect::Suspicion>,
+    baseline: suspect::Baseline,
+}
+
+impl Suspicions {
+    pub fn of_process(&self, k: ProcKey) -> impl Iterator<Item = &suspect::Suspicion> {
+        self.list
+            .iter()
+            .filter(move |s| s.target == suspect::Target::Process(k))
+    }
+
+    pub fn is_suspect(&self, k: ProcKey) -> bool {
+        self.of_process(k).next().is_some()
+    }
+
+    pub fn of_service<'a>(
+        &'a self,
+        location: &'a str,
+    ) -> impl Iterator<Item = &'a suspect::Suspicion> {
+        self.list
+            .iter()
+            .filter(move |s| matches!(&s.target, suspect::Target::Service(l) if l == location))
+    }
+}
+
+/// Something on the map that is not a process tower but can be hovered:
+/// a dormant service's ghost, a port's gate, a remote address.
+#[derive(Clone, Debug)]
+pub struct Landmark {
+    pub min: Vec3,
+    pub max: Vec3,
+    pub title: String,
+    pub detail: String,
+    /// Shown in the suspicion color.
+    pub suspect: bool,
+    /// Its id in the scene's shaders (lights up on hover), or -1.
+    pub shader_id: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct Landmarks {
+    pub list: Vec<Landmark>,
+    pub hovered: Option<usize>,
+}
+
+/// Requests from the scene to the source (e.g. read the firewall's rules).
+#[derive(Resource, Default)]
+pub struct SourceRequests(pub Option<crossbeam_channel::Sender<bw_model::Request>>);
 
 /// What the user is looking at.
 #[derive(Resource, Debug)]
@@ -134,6 +211,8 @@ pub struct WorldLabel {
 pub enum LabelKind {
     Subsystem,
     Volume,
+    /// Something suspicious (the Wall's magenta).
+    Alert,
 }
 
 /// Maps process keys to their entities.
@@ -156,13 +235,16 @@ impl Plugin for ScenePlugin {
             .init_resource::<SceneSettings>()
             .init_resource::<SceneLayout>()
             .init_resource::<ProcEntities>()
+            .init_resource::<Suspicions>()
+            .init_resource::<Landmarks>()
+            .init_resource::<SourceRequests>()
             .insert_resource(ClearColor(Color::BLACK))
             .configure_sets(
                 Update,
                 (SceneSet::Ingest, SceneSet::Layout, SceneSet::Visuals).chain(),
             )
             .add_systems(Update, ingest.in_set(SceneSet::Ingest))
-            .add_systems(Update, update_layout.in_set(SceneSet::Layout));
+            .add_systems(Update, (update_layout, assess).in_set(SceneSet::Layout));
         explore::plugin(app);
         wall::plugin(app);
         city::plugin(app);
@@ -171,6 +253,7 @@ impl Plugin for ScenePlugin {
         pick::plugin(app);
         camera::plugin(app);
         quality::plugin(app);
+        blackwall::plugin(app);
     }
 }
 
@@ -191,12 +274,28 @@ fn ingest(rx: Option<Res<SourceRx>>, mut m: ResMut<Machine>) {
         match update {
             Update::Snapshot(s) => {
                 m.born.extend(s.processes.keys().copied());
+                // Firewall rules may have arrived first (they come separately).
+                let fw = std::mem::take(&mut m.snapshot.net.firewall);
                 m.snapshot = *s;
+                if m.snapshot.net.firewall.status == bw_model::FirewallStatus::Unknown {
+                    m.snapshot.net.firewall = fw;
+                }
                 m.received = true;
             }
             Update::Detail(d) => {
                 m.detail = Some(*d);
                 m.detail_gen += 1;
+                continue;
+            }
+            Update::Services(v) => {
+                m.services = v;
+                m.services_gen += 1;
+                m.generation += 1;
+                continue;
+            }
+            Update::Firewall(fw) => {
+                m.snapshot.net.firewall = *fw;
+                m.generation += 1;
                 continue;
             }
             Update::Delta(d) => {
@@ -262,6 +361,39 @@ fn update_layout(
         layout, targets, ..
     } = &mut *sl;
     layout.positions(targets);
+}
+
+/// Re-run the suspicion rules whenever the machine changes.
+fn assess(m: Res<Machine>, mut sus: ResMut<Suspicions>, mut last: Local<u64>) {
+    if m.generation == *last || !m.received {
+        return;
+    }
+    *last = m.generation;
+    let Suspicions { list, baseline } = &mut *sus;
+    baseline.observe(&m.snapshot);
+    *list = suspect::assess(
+        &m.snapshot,
+        &m.services,
+        &m.cpu_history,
+        &m.mem_history,
+        baseline,
+    );
+}
+
+/// A duration in words: "3 days", "14 months".
+pub fn fmt_age(secs: u64) -> String {
+    let d = secs / 86_400;
+    match d {
+        0 => match secs / 3600 {
+            0 => "minutes".into(),
+            1 => "an hour".into(),
+            h => format!("{h} hours"),
+        },
+        1 => "a day".into(),
+        2..=59 => format!("{d} days"),
+        60..=729 => format!("{} months", d / 30),
+        _ => format!("{} years", d / 365),
+    }
 }
 
 /// Bytes as megabytes or gigabytes, for in-world labels.

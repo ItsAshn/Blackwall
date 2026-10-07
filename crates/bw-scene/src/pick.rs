@@ -33,6 +33,7 @@ fn ray_box(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 enum Hit {
     Tower(ProcKey),
     Element(usize),
+    Landmark(usize),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -46,6 +47,8 @@ fn pick(
     settings: Res<SceneSettings>,
     mut sel: ResMut<Selection>,
     mut ex: ResMut<Explore>,
+    mut marks: ResMut<Landmarks>,
+    mut orbit: ResMut<crate::camera::OrbitCam>,
     mut press: Local<Option<Vec2>>,
 ) {
     let (Ok(window), Ok((cam, cam_tf))) = (window.single(), camera.single()) else {
@@ -60,7 +63,8 @@ fn pick(
                 return Some(Hit::Element(i));
             }
         }
-        sl.layout
+        let tower = sl
+            .layout
             .columns
             .iter()
             .filter(|c| settings.show_kernel || c.realm == bw_model::Realm::User)
@@ -73,12 +77,36 @@ fn pick(
                     Vec3::new(c.min.x, 0.0, c.min.y),
                     Vec3::new(c.max.x, c.height(), c.max.y),
                 )
-                .map(|t| (t, c.key))
+                .map(|t| (t, Hit::Tower(c.key)))
             })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, k)| Hit::Tower(k))
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let mark = marks
+            .list
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                ray_box(ray.origin, dir, l.min, l.max).map(|t| (t, Hit::Landmark(i)))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        match (tower, mark) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a.1 } else { b.1 }),
+            (a, b) => a.or(b).map(|x| x.1),
+        }
     };
-    let activate = |h: Hit, ex: &mut Explore, sel: &mut Selection| match h {
+    let activate = |h: Hit,
+                    ex: &mut Explore,
+                    sel: &mut Selection,
+                    marks: &Landmarks,
+                    cam: &mut crate::camera::OrbitCam| match h {
+        // A gate, ghost or remote address: go and look at it.
+        Hit::Landmark(i) => {
+            if let Some(l) = marks.list.get(i) {
+                cam.frame(
+                    (l.min + l.max) * 0.5,
+                    (l.max - l.min).max_element().max(1.0),
+                );
+            }
+        }
         Hit::Tower(k) if sel.key == Some(k) && ex.inside().is_none() => ex.dive(k),
         Hit::Tower(k) => {
             sel.key = Some(k);
@@ -101,22 +129,27 @@ fn pick(
             && t.start_position().distance(t.position()) < 12.0
             && let Some(h) = hit_at(t.position(), &ex)
         {
-            activate(h, &mut ex, &mut sel);
+            activate(h, &mut ex, &mut sel, &marks, &mut orbit);
         }
     }
 
     let Some(cursor) = window.cursor_position().filter(|_| !block.pointer) else {
         sel.hovered = None;
         ex.hovered = None;
+        marks.hovered = None;
         *press = None;
         return;
     };
     let hovered = hit_at(cursor, &ex);
-    let (ht, he) = match hovered {
-        Some(Hit::Tower(k)) => (Some(k), None),
-        Some(Hit::Element(i)) => (None, Some(i)),
-        None => (None, None),
+    let (ht, he, hl) = match hovered {
+        Some(Hit::Tower(k)) => (Some(k), None, None),
+        Some(Hit::Element(i)) => (None, Some(i), None),
+        Some(Hit::Landmark(i)) => (None, None, Some(i)),
+        None => (None, None, None),
     };
+    if marks.hovered != hl {
+        marks.hovered = hl;
+    }
     if sel.hovered != ht {
         sel.hovered = ht;
     }
@@ -131,7 +164,7 @@ fn pick(
         if press.is_some_and(|p| p.distance(cursor) < 5.0)
             && let Some(h) = hovered
         {
-            activate(h, &mut ex, &mut sel);
+            activate(h, &mut ex, &mut sel, &marks, &mut orbit);
         }
         *press = None;
     }
