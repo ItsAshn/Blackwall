@@ -108,10 +108,11 @@ impl Subsystem {
 /// Dots stacked in a column: more memory, more dots (logarithmic).
 pub fn levels(p: &Process) -> u32 {
     if p.realm == Realm::Kernel {
-        return 3;
+        return 4;
     }
+    // Monoliths: twice the dots of before, so a big process towers over you.
     let mb = p.mem_bytes as f32 / 1_048_576.0;
-    (2.0 + 5.0 * (1.0 + mb).log10()).round().clamp(2.0, 24.0) as u32
+    (4.0 + 10.0 * (1.0 + mb).log10()).round().clamp(4.0, 48.0) as u32
 }
 
 /// Side of the column's dot footprint: big processes are denser columns.

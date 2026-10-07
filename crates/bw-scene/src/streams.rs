@@ -101,6 +101,7 @@ fn setup(
             MeshMaterial3d(ok.clone()),
             Transform::from_scale(Vec3::splat(0.06)),
             Visibility::Hidden,
+            crate::explore::MachineLayer,
         ));
     }
     commands.insert_resource(ParticleMats { ok, bad });
@@ -170,7 +171,14 @@ fn advance(
         &mut Visibility,
         &mut MeshMaterial3d<StandardMaterial>,
     )>,
+    ex: Res<crate::explore::Explore>,
 ) {
+    if ex.inside().is_some() {
+        for (_, _, mut vis, _) in &mut q {
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
     let dt = if settings.reduced_motion {
         time.delta_secs() * 0.25
     } else {

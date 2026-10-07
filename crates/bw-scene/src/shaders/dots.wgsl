@@ -31,6 +31,8 @@ const KIND_VOLUME: f32 = 2.0;
 const KIND_FLOOR: f32 = 3.0;
 const KIND_CRITICAL: f32 = 4.0;
 const KIND_DYING: f32 = 5.0;
+const KIND_FLOW: f32 = 6.0;
+const KIND_WATCH: f32 = 7.0;
 
 fn hash11(x: f32) -> f32 {
     return fract(sin(x * 127.1 + 3.7) * 43758.5453);
@@ -96,9 +98,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
                 discard;
             }
             let cpu = uv.x;
-            let f = fract(uv.y * 1.5 - t * (0.12 + cpu * 1.4) + phase);
-            let pulse = pow(f, 14.0) * (0.6 + cpu * 5.0);
-            b = 0.3 + cpu * 1.6 + pulse;
+            if (is_kind(kind, KIND_FLOW)) {
+                // A conduit: dots flowing along its path.
+                b = 0.22 + pow(fract(uv.y * 14.0 - t * 0.7 + phase), 10.0) * 2.4;
+            } else {
+                let f = fract(uv.y * 1.5 - t * (0.12 + cpu * 1.4) + phase);
+                let pulse = pow(f, 14.0) * (0.6 + cpu * 5.0);
+                b = 0.3 + cpu * 1.6 + pulse;
+            }
+            if (is_kind(kind, KIND_WATCH) && !reduced) {
+                // Worth watching: a slow breath, so it can be spotted from afar.
+                b = b * (0.7 + 0.8 * (sin(t * 3.0 + phase * 6.0) * 0.5 + 0.5));
+            }
             if (is_kind(kind, KIND_CRITICAL)) {
                 // Issues blink at 1.3 Hz; under reduced motion they hold fully lit.
                 if (reduced) {
@@ -106,7 +117,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
                 } else {
                     b = b * (0.35 + 1.25 * step(0.5, fract(t * 1.3 + phase)));
                 }
-            } else if (params.b.x > 0.5) {
+            } else if (params.b.x > 0.5 && !is_kind(kind, KIND_WATCH)) {
                 b = b * 0.08;
             }
             if (is_kind(kind, KIND_KERNEL)) {
@@ -115,7 +126,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         rgb = burn(col.rgb, b);
         if (abs(id - params.a.z) < 0.5) {
-            rgb = mix(rgb, vec3<f32>(2.6, 2.8, 3.0), 0.65);
+            // Chosen: blazing, but it keeps its health hue (red stays red).
+            let lift = b * 1.8 + 0.6;
+            rgb = mix(col.rgb * lift, vec3<f32>(lift), 0.18);
         } else if (abs(id - params.a.w) < 0.5) {
             rgb = burn(col.rgb, b * 2.2 + 0.4);
         }

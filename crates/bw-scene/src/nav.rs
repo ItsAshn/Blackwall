@@ -63,8 +63,13 @@ fn navigate(
     m: Res<Machine>,
     sl: Res<SceneLayout>,
     mut sel: ResMut<Selection>,
+    ex: Res<crate::explore::Explore>,
 ) {
-    if block.keyboard || keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
+    // Inside a process the arrows walk its interior instead (explore.rs).
+    if ex.inside().is_some()
+        || block.keyboard
+        || keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+    {
         return;
     }
     let s = &m.snapshot;

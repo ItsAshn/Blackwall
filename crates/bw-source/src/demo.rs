@@ -5,8 +5,8 @@
 //! it appears, so it is never mistaken for real telemetry.
 
 use bw_model::{
-    Capabilities, HostInfo, Interface, Owner, ProcKey, ProcState, Process, Realm, Snapshot,
-    SystemStats, Volume,
+    Capabilities, FdInfo, FdKind, HostInfo, Interface, MemRegion, Owner, ProcKey, ProcState,
+    Process, ProcessDetail, Realm, RegionKind, Snapshot, SystemStats, ThreadInfo, Volume,
 };
 use bw_platform::Collector;
 use std::collections::BTreeMap;
@@ -48,6 +48,10 @@ pub struct DemoWorld {
     next_pid: u32,
     /// Short-lived compiler processes that come and go.
     transient: Vec<(u32, u64)>,
+    /// The latest sample, for synthesizing process internals.
+    last: Option<Snapshot>,
+    /// The Web Content process with a leak to find.
+    leaky: Option<ProcKey>,
 }
 
 impl DemoWorld {
@@ -58,6 +62,8 @@ impl DemoWorld {
             specs: Vec::new(),
             next_pid: 300,
             transient: vec![],
+            last: None,
+            leaky: None,
         };
         w.build();
         w
@@ -406,11 +412,35 @@ impl Collector for DemoWorld {
             process_io: true,
             load_average: true,
             pressure_stall: true,
+            process_detail: true,
             ..Default::default()
         }
     }
 
+    fn detail(&mut self, key: ProcKey) -> Option<ProcessDetail> {
+        let snap = self.last.as_ref()?;
+        let p = snap.processes.get(&key)?;
+        Some(demo_detail(p, self.tick, Some(key) == self.leaky))
+    }
+
     fn sample(&mut self) -> Snapshot {
+        let s = self.sample_inner();
+        if self.leaky.is_none() {
+            // The fourth Web Content process (the one with the runaway thread) leaks.
+            self.leaky = s
+                .processes
+                .values()
+                .filter(|p| p.name == "Web Content")
+                .nth(2)
+                .map(|p| p.key);
+        }
+        self.last = Some(s.clone());
+        s
+    }
+}
+
+impl DemoWorld {
+    fn sample_inner(&mut self) -> Snapshot {
         self.tick += 1;
         let t = self.tick as f32;
         let boot = 1_760_000_000u64;
@@ -630,6 +660,305 @@ mod tests {
         assert_ne!(
             sa.processes.keys().collect::<Vec<_>>(),
             later.processes.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Plausible internals for a demo process. Deterministic per process and
+/// tick, with planted anomalies: rsync's main thread stuck in IO wait, one
+/// Web Content process leaking heap and descriptors, a spinning JS helper.
+fn demo_detail(p: &Process, tick: u64, leaky: bool) -> ProcessDetail {
+    let mut rng = Rng((p.key.pid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let base = p
+        .name
+        .split([' ', ':'])
+        .next()
+        .unwrap_or(&p.name)
+        .to_string();
+    let names: Vec<String> = match base.as_str() {
+        "firefox" | "Web" | "Isolated" => {
+            let mut v: Vec<String> = [
+                "MainThread",
+                "IPC I/O Child",
+                "Timer",
+                "Socket Thread",
+                "ImageIO",
+                "Compositor",
+                "DOM Worker",
+                "MediaDecoder",
+                "StyleThread#0",
+                "StyleThread#1",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            v.extend((0..6).map(|i| format!("JS Helper #{i}")));
+            v
+        }
+        "rust-analyzer" => std::iter::once("main".to_string())
+            .chain((0..14).map(|i| format!("Worker {i}")))
+            .chain(["Vfs", "Flycheck", "LspServer"].map(String::from))
+            .collect(),
+        "rustc" => std::iter::once("rustc".to_string())
+            .chain((0..8).map(|i| format!("opt cgu.{i:02}")))
+            .collect(),
+        "code" | "spotify" | "discord" | "steam" => std::iter::once(base.clone())
+            .chain(
+                [
+                    "Chrome_ChildIOT",
+                    "ThreadPoolForeg",
+                    "ThreadPoolForeg",
+                    "CompositorTileW",
+                    "VideoFrameCompo",
+                    "NetworkService",
+                ]
+                .map(String::from),
+            )
+            .collect(),
+        "gnome-shell" => [
+            "gnome-shell",
+            "gmain",
+            "gdbus",
+            "pool-gnome-shel",
+            "JS Helper",
+            "KMS thread",
+        ]
+        .map(String::from)
+        .to_vec(),
+        "postgres" | "rsync" | "zsh" | "nginx" | "cargo" => vec![base.clone()],
+        _ => {
+            let n = p.threads.unwrap_or(1).clamp(1, 6) as usize;
+            std::iter::once(base.clone())
+                .chain((1..n).map(|i| format!("{base}-worker-{i}")))
+                .collect()
+        }
+    };
+    let n = names.len().max(1);
+    let threads: Vec<ThreadInfo> = names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let share = if i == 0 { 0.4 } else { 0.6 / n as f32 };
+            let mut state = if p.state == ProcState::Zombie {
+                ProcState::Zombie
+            } else if rng.f() < 0.15 {
+                ProcState::Running
+            } else {
+                ProcState::Sleeping
+            };
+            let mut cpu = p.cpu_pct * share * (0.5 + rng.f());
+            if p.state == ProcState::DiskWait && i == 0 {
+                state = ProcState::DiskWait;
+            }
+            if leaky && name == "JS Helper #3" {
+                state = ProcState::Running;
+                cpu = 96.0 + rng.f() * 3.0;
+            }
+            ThreadInfo {
+                tid: p.key.pid + i as u32,
+                name,
+                state,
+                cpu_pct: cpu,
+            }
+        })
+        .collect();
+
+    const MB: u64 = 1 << 20;
+    let mem = p.mem_bytes.max(4 * MB);
+    let libs: &[(&str, u64)] = match base.as_str() {
+        "firefox" | "Web" | "Isolated" => &[
+            ("libxul.so", 140),
+            ("libnss3.so", 4),
+            ("libgtk-3.so.0", 8),
+            ("libmozsqlite3.so", 2),
+            ("libc.so.6", 2),
+            ("libm.so.6", 1),
+            ("libstdc++.so.6", 3),
+            ("libfreetype.so.6", 1),
+        ],
+        "rustc" | "cargo" | "rust-analyzer" => &[
+            ("librustc_driver.so", 120),
+            ("libLLVM.so.19", 110),
+            ("libc.so.6", 2),
+            ("libstdc++.so.6", 3),
+            ("libz.so.1", 1),
+        ],
+        "code" | "spotify" | "discord" | "steam" => &[
+            ("libffmpeg.so", 3),
+            ("libvk_swiftshader.so", 6),
+            ("libnss3.so", 4),
+            ("libgtk-3.so.0", 8),
+            ("libc.so.6", 2),
+        ],
+        _ => &[
+            ("libc.so.6", 2),
+            ("libm.so.6", 1),
+            ("libssl.so.3", 1),
+            ("libcrypto.so.3", 5),
+        ],
+    };
+    let growth = if leaky { tick * 6 * MB } else { 0 };
+    let mut regions = vec![
+        MemRegion {
+            kind: RegionKind::Code,
+            label: base.clone(),
+            size_bytes: (2 + rng.next() % 24) * MB,
+        },
+        MemRegion {
+            kind: RegionKind::Heap,
+            label: "[heap]".into(),
+            size_bytes: mem * 35 / 100 + growth,
+        },
+        MemRegion {
+            kind: RegionKind::Anonymous,
+            label: "anonymous".into(),
+            size_bytes: mem * 55 / 100,
+        },
+        MemRegion {
+            kind: RegionKind::Stack,
+            label: "[stack]".into(),
+            size_bytes: 8 * MB * n as u64,
+        },
+        MemRegion {
+            kind: RegionKind::Kernel,
+            label: "[vdso]".into(),
+            size_bytes: 8 << 10,
+        },
+    ];
+    regions.extend(libs.iter().map(|(l, m)| MemRegion {
+        kind: RegionKind::Library,
+        label: l.to_string(),
+        size_bytes: m * MB,
+    }));
+    for f in ["fonts.cache-1", "locale-archive"] {
+        regions.push(MemRegion {
+            kind: RegionKind::File,
+            label: f.into(),
+            size_bytes: (1 + rng.next() % 12) * MB,
+        });
+    }
+
+    let (files, sockets, pipes): (u32, u32, u32) = match base.as_str() {
+        "firefox" => (90, 60, 40),
+        "Web" | "Isolated" => (24, 6, 14),
+        "postgres" => (30, 12, 2),
+        "nginx" => (6, 24, 2),
+        "rsync" => (12, 0, 2),
+        "rust-analyzer" | "code" => (60, 8, 10),
+        _ => (4 + (rng.next() % 6) as u32, (rng.next() % 3) as u32, 2),
+    };
+    let leak = if leaky { (tick * 4) as u32 } else { 0 };
+    let mut fds = vec![
+        FdInfo {
+            fd: 0,
+            kind: FdKind::Device,
+            target: "/dev/null".into(),
+        },
+        FdInfo {
+            fd: 1,
+            kind: FdKind::Device,
+            target: "/dev/pts/0".into(),
+        },
+        FdInfo {
+            fd: 2,
+            kind: FdKind::Device,
+            target: "/dev/pts/0".into(),
+        },
+    ];
+    let mut fd = 3;
+    let file_names = [
+        "/home/ashn/.cache/index",
+        "/usr/share/fonts/NotoSans.ttf",
+        "/var/lib/data.db",
+        "/home/ashn/.config/settings.json",
+        "/tmp/session.lock",
+    ];
+    for i in 0..files + leak {
+        let target = if i >= files {
+            format!("/home/ashn/.cache/blob-{i:04}.tmp")
+        } else {
+            file_names[i as usize % file_names.len()].to_string()
+        };
+        fds.push(FdInfo {
+            fd,
+            kind: FdKind::File,
+            target,
+        });
+        fd += 1;
+    }
+    for i in 0..sockets {
+        fds.push(FdInfo {
+            fd,
+            kind: FdKind::Socket,
+            target: format!("socket:[{}]", 40_000 + p.key.pid * 7 + i),
+        });
+        fd += 1;
+    }
+    for i in 0..pipes {
+        let kind = if i % 3 == 0 {
+            FdKind::Event
+        } else {
+            FdKind::Pipe
+        };
+        let target = if kind == FdKind::Event {
+            "anon_inode:[eventfd]".into()
+        } else {
+            format!("pipe:[{}]", 90_000 + p.key.pid + i)
+        };
+        fds.push(FdInfo { fd, kind, target });
+        fd += 1;
+    }
+    let fd_count = fds.len() as u32;
+    fds.truncate(512);
+    ProcessDetail {
+        key: Some(p.key),
+        time_ms: tick * 1000,
+        threads,
+        regions,
+        fds,
+        fd_count,
+        restricted: false,
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn planted_anomalies_are_findable() {
+        let mut w = DemoWorld::new(7);
+        let s = w.sample();
+        let rsync = s
+            .processes
+            .values()
+            .find(|p| p.name == "rsync")
+            .unwrap()
+            .key;
+        let d = w.detail(rsync).unwrap();
+        assert_eq!(
+            d.threads[0].state,
+            ProcState::DiskWait,
+            "rsync main thread stuck in IO"
+        );
+
+        let leaky = w.leaky.expect("a leaky process was chosen");
+        let a = w.detail(leaky).unwrap();
+        w.sample();
+        w.sample();
+        let b = w.detail(leaky).unwrap();
+        let heap = |d: &ProcessDetail| {
+            d.regions
+                .iter()
+                .find(|r| r.kind == RegionKind::Heap)
+                .unwrap()
+                .size_bytes
+        };
+        assert!(heap(&b) > heap(&a), "heap grows");
+        assert!(b.fd_count > a.fd_count, "descriptors climb");
+        assert!(
+            b.threads.iter().any(|t| t.cpu_pct > 90.0),
+            "a spinning thread"
         );
     }
 }

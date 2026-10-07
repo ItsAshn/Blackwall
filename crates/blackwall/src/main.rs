@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra]
-//!           [--size WxH] [--select NAME] [--hide-ui] [--no-intro]
+//!           [--size WxH] [--select NAME] [--dive NAME [--find]] [--hide-ui] [--no-intro]
 //!           [--screenshot PATH [--after SECONDS]]
 //! ```
 
@@ -24,13 +24,15 @@ struct Args {
     select: Option<String>,
     hide_ui: bool,
     no_intro: bool,
+    dive: Option<String>,
+    find: bool,
     screenshot: Option<String>,
     after: f32,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--hide-ui] [--no-intro] [--screenshot PATH [--after SECONDS]]"
+        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--dive NAME [--find]] [--hide-ui] [--no-intro]\n                 [--screenshot PATH [--after SECONDS]]"
     );
     std::process::exit(2)
 }
@@ -44,6 +46,8 @@ fn parse_args() -> Args {
         select: None,
         hide_ui: false,
         no_intro: false,
+        dive: None,
+        find: false,
         screenshot: None,
         after: 8.0,
     };
@@ -67,6 +71,8 @@ fn parse_args() -> Args {
             "--select" => a.select = Some(val()),
             "--hide-ui" => a.hide_ui = true,
             "--no-intro" => a.no_intro = true,
+            "--dive" => a.dive = Some(val()),
+            "--find" => a.find = true,
             "--screenshot" => a.screenshot = Some(val()),
             "--after" => a.after = val().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
@@ -88,6 +94,7 @@ fn main() -> AppExit {
         SourceKind::Live
     };
 
+    let source = bw_source::spawn(kind, args.interval);
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -100,7 +107,7 @@ fn main() -> AppExit {
     }))
     .add_plugins((EguiPlugin::default(), ScenePlugin, UiPlugin))
     .insert_resource(Quality::new(args.quality))
-    .insert_resource(SourceRx(bw_source::spawn(kind, args.interval)))
+    .insert_resource(SourceRx(source.updates))
     .insert_resource({
         let mut ui = UiState::default();
         ui.hidden = args.hide_ui;
@@ -108,8 +115,9 @@ fn main() -> AppExit {
     })
     .insert_resource(bw_scene::camera::JackIn::new(!args.no_intro))
     .insert_resource(LaunchArgs(args.clone()));
+    app.insert_resource(bw_scene::explore::SourceFocus(Some(source.focus)));
 
-    if args.select.is_some() {
+    if args.select.is_some() || args.dive.is_some() {
         app.add_systems(Update, preselect);
     }
     if args.screenshot.is_some() {
@@ -122,26 +130,55 @@ fn main() -> AppExit {
 struct LaunchArgs(Args);
 
 /// `--select NAME`: select the busiest process with that name once data arrives.
+/// `--dive NAME`: also dive into it once the jack-in is done; `--find`:
+/// then fly to its first anomaly.
 fn preselect(
     args: Res<LaunchArgs>,
     m: Res<Machine>,
     mut sel: ResMut<Selection>,
-    mut done: Local<bool>,
+    mut ex: ResMut<bw_scene::explore::Explore>,
+    jack: Res<bw_scene::camera::JackIn>,
+    mut stage: Local<u8>,
 ) {
-    if *done || !m.received {
+    if !m.received {
         return;
     }
-    *done = true;
-    let name = args.0.select.as_deref().unwrap_or_default();
-    sel.key = m
-        .snapshot
-        .processes
-        .values()
-        .filter(|p| p.name == name)
-        .max_by(|a, b| a.cpu_pct.total_cmp(&b.cpu_pct))
-        .map(|p| p.key);
-    if sel.key.is_none() {
-        warn!("--select: no process named {name:?}");
+    match *stage {
+        0 => {
+            let name = args
+                .0
+                .dive
+                .as_deref()
+                .or(args.0.select.as_deref())
+                .unwrap_or_default();
+            sel.key = m
+                .snapshot
+                .processes
+                .values()
+                .filter(|p| p.name == name)
+                .max_by(|a, b| a.cpu_pct.total_cmp(&b.cpu_pct))
+                .map(|p| p.key);
+            if sel.key.is_none() {
+                warn!("--select/--dive: no process named {name:?}");
+            }
+            *stage = 1;
+        }
+        1 if args.0.dive.is_some() && (jack.done || !jack.enabled) => {
+            if let Some(k) = sel.key {
+                ex.dive(k);
+            }
+            *stage = 2;
+        }
+        2 if args.0.find && ex.inside().is_some() && !ex.anomalies.is_empty() => {
+            let target = ex
+                .interior
+                .elements
+                .iter()
+                .position(|e| e.kind == ex.anomalies[0].element);
+            ex.choose(target);
+            *stage = 3;
+        }
+        _ => {}
     }
 }
 

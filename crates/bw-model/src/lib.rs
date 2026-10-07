@@ -186,6 +186,8 @@ pub struct Capabilities {
     pub pressure_stall: bool,
     pub smart: bool,
     pub temperatures: bool,
+    /// Threads, memory map and descriptors of a single process.
+    pub process_detail: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -289,11 +291,85 @@ impl Snapshot {
     }
 }
 
+/// One thread of a process: a floor of its tower.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThreadInfo {
+    pub tid: u32,
+    pub name: String,
+    pub state: ProcState,
+    /// Percent of one core since the previous detail sample.
+    pub cpu_pct: f32,
+}
+
+/// What a memory region holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RegionKind {
+    /// The executable's own code and data.
+    Code,
+    /// Shared libraries.
+    Library,
+    Heap,
+    /// Anonymous mappings (allocator arenas, JIT, GPU buffers…).
+    Anonymous,
+    /// Memory-mapped files.
+    File,
+    Stack,
+    /// vdso, vvar, vsyscall and the like.
+    Kernel,
+}
+
+/// A group of mappings in a process's address space: a stratum of its core.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemRegion {
+    pub kind: RegionKind,
+    /// The library or file name, or a kind label ("[heap]", "anonymous").
+    pub label: String,
+    /// Virtual size in bytes (what the OS reports for the mappings).
+    pub size_bytes: u64,
+}
+
+/// What an open file descriptor points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum FdKind {
+    File,
+    Socket,
+    Pipe,
+    Device,
+    /// anon_inode: eventfd, epoll, timerfd, signalfd…
+    Event,
+    Other,
+}
+
+/// One open descriptor: a conduit leaving the tower.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FdInfo {
+    pub fd: i32,
+    pub kind: FdKind,
+    /// Path, `socket:[inode]`, `pipe:[inode]` or the anon_inode name.
+    pub target: String,
+}
+
+/// The inside of one process, collected only for the process being explored.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProcessDetail {
+    pub key: Option<ProcKey>,
+    pub time_ms: u64,
+    pub threads: Vec<ThreadInfo>,
+    pub regions: Vec<MemRegion>,
+    /// At most a few hundred descriptors are listed; `fd_count` is the total.
+    pub fds: Vec<FdInfo>,
+    pub fd_count: u32,
+    /// The OS refused some of it (another user's process without elevation).
+    pub restricted: bool,
+}
+
 /// Message stream from a source to its consumers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Update {
     Snapshot(Box<Snapshot>),
     Delta(Box<Delta>),
+    /// Internals of the process currently being explored.
+    Detail(Box<ProcessDetail>),
 }
 
 #[cfg(test)]

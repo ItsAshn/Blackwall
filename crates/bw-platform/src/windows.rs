@@ -41,3 +41,14 @@ pub fn is_system_account(sid: &str, _name: Option<&str>) -> bool {
     // LocalSystem, LocalService, NetworkService, and service SIDs.
     matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20") || sid.starts_with("S-1-5-80-")
 }
+
+/// Process internals are Linux-only for now (Milestone 6 adds Toolhelp
+/// thread snapshots and VirtualQueryEx on Windows, proc_pidinfo on macOS).
+pub fn detail(
+    _pid: u32,
+    _exe: Option<&str>,
+    _ticks: &mut std::collections::HashMap<u32, u64>,
+    _elapsed: f32,
+) -> Option<bw_model::ProcessDetail> {
+    None
+}

@@ -34,11 +34,18 @@ fn pick(
     sl: Res<SceneLayout>,
     settings: Res<SceneSettings>,
     mut sel: ResMut<Selection>,
+    mut ex: ResMut<crate::explore::Explore>,
     mut press: Local<Option<Vec2>>,
 ) {
     let (Ok(window), Ok((cam, cam_tf))) = (window.single(), camera.single()) else {
         return;
     };
+    if ex.inside().is_some() {
+        pick_inside(
+            window, cam, cam_tf, &buttons, &touches, &block, &mut ex, &mut sel, &mut press,
+        );
+        return;
+    }
     let hit_at = |screen: Vec2| -> Option<ProcKey> {
         let ray = cam.viewport_to_world(cam_tf, screen).ok()?;
         let dir: Vec3 = *ray.direction;
@@ -94,6 +101,64 @@ fn pick(
         {
             sel.key = Some(k);
             sel.follow = true;
+        }
+        *press = None;
+    }
+}
+
+/// Picking inside a process: the interior's elements.
+#[allow(clippy::too_many_arguments)]
+fn pick_inside(
+    window: &Window,
+    cam: &Camera,
+    cam_tf: &GlobalTransform,
+    buttons: &ButtonInput<MouseButton>,
+    touches: &Touches,
+    block: &InputBlock,
+    ex: &mut crate::explore::Explore,
+    sel: &mut Selection,
+    press: &mut Option<Vec2>,
+) {
+    let hit = |screen: Vec2, ex: &crate::explore::Explore| {
+        let ray = cam.viewport_to_world(cam_tf, screen).ok()?;
+        crate::interior::pick(&ex.interior, ray.origin, *ray.direction)
+    };
+    let activate = |i: usize, ex: &mut crate::explore::Explore, sel: &mut Selection| {
+        // Choosing a satellite that is already chosen dives into that child.
+        if ex.element == Some(i)
+            && let crate::interior::ElementKind::Satellite { child } = ex.interior.elements[i].kind
+        {
+            sel.key = Some(child);
+            ex.dive(child);
+            return;
+        }
+        ex.choose(Some(i));
+    };
+    for t in touches.iter_just_released() {
+        if !block.pointer
+            && t.start_position().distance(t.position()) < 12.0
+            && let Some(i) = hit(t.position(), ex)
+        {
+            activate(i, ex, sel);
+        }
+    }
+    let Some(cursor) = window.cursor_position().filter(|_| !block.pointer) else {
+        ex.hovered = None;
+        *press = None;
+        return;
+    };
+    let hovered = hit(cursor, ex);
+    if ex.hovered != hovered {
+        ex.hovered = hovered;
+    }
+    if buttons.just_pressed(MouseButton::Left) {
+        *press = Some(cursor);
+    }
+    if buttons.just_released(MouseButton::Left) {
+        if press.is_some_and(|p| p.distance(cursor) < 5.0)
+            && let Some(i) = hovered
+        {
+            activate(i, ex, sel);
         }
         *press = None;
     }

@@ -42,6 +42,7 @@ fn setup(
     // The Wall; resized once the first layout is known.
     commands.spawn((
         WallSurface,
+        crate::explore::MachineLayer,
         Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
         MeshMaterial3d(wall_mats.add(WallMaterial::default())),
         Transform::from_xyz(0.0, 17.0, -40.0),
@@ -49,6 +50,7 @@ fn setup(
     for s in Subsystem::ALL {
         commands.spawn((
             SubsystemLabel(s),
+            crate::explore::MachineLayer,
             Transform::default(),
             Visibility::default(),
             WorldLabel {
@@ -163,6 +165,8 @@ fn update_labels(
     m: Res<Machine>,
     sl: Res<SceneLayout>,
     settings: Res<SceneSettings>,
+    ex: Res<crate::explore::Explore>,
+    sel: Res<Selection>,
     mut subs: Query<(&SubsystemLabel, &mut Transform, &mut Visibility), Without<VolumeLabel>>,
     mut vols: Query<
         (Entity, &VolumeLabel, &mut Transform, &mut WorldLabel),
@@ -171,7 +175,8 @@ fn update_labels(
 ) {
     for (s, mut tf, mut vis) in &mut subs {
         tf.translation = sl.layout.district_pos(s.0) + Vec3::Y * 1.2;
-        *vis = if settings.show_kernel {
+        // Named only from the overview; at street level they'd be clutter.
+        *vis = if settings.show_kernel && ex.inside().is_none() && sel.key.is_none() {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -185,6 +190,7 @@ fn update_labels(
         for i in 0..volumes.len() {
             commands.spawn((
                 VolumeLabel(i),
+                crate::explore::MachineLayer,
                 Transform::default(),
                 Visibility::default(),
                 WorldLabel {

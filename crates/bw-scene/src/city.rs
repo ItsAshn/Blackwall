@@ -7,6 +7,8 @@
 //! changes: how much of it is lit is a shader uniform.
 
 use crate::camera::JackIn;
+use crate::explore::MachineLayer;
+use crate::interior::{self, ELEMENT_ID_BASE, ElementKind, Interior};
 use crate::layout::{Column, LEVEL_H};
 use crate::palette::{self, linear};
 use crate::*;
@@ -75,10 +77,10 @@ pub struct FloorInfo {
 struct Born(HashMap<ProcKey, f32>);
 
 #[derive(Resource)]
-struct CityHandles {
+pub(crate) struct CityHandles {
     city: Handle<Mesh>,
     floor: Handle<Mesh>,
-    mat: Handle<DotsMaterial>,
+    pub(crate) mat: Handle<DotsMaterial>,
 }
 
 const KIND_PROCESS: f32 = 0.0;
@@ -87,6 +89,8 @@ const KIND_VOLUME: f32 = 2.0;
 const KIND_FLOOR: f32 = 3.0;
 const KIND_CRITICAL: f32 = 4.0;
 const KIND_DYING: f32 = 5.0;
+const KIND_FLOW: f32 = 6.0;
+const KIND_WATCH: f32 = 7.0;
 
 /// How long an exited process takes to dissolve.
 const DISSOLVE_SECS: f32 = 1.2;
@@ -97,7 +101,7 @@ const MAX_FLOOR_DOTS: u64 = 12_000;
 pub const VOLUME_ID_BASE: usize = 1_000_000;
 
 #[derive(Default)]
-struct DotMesh {
+pub(crate) struct DotMesh {
     pos: Vec<[f32; 3]>,
     uv: Vec<[f32; 2]>,
     uv_b: Vec<[f32; 2]>,
@@ -107,7 +111,7 @@ struct DotMesh {
 
 impl DotMesh {
     /// A small axis-aligned cube: the dots are square, like the reference.
-    fn cube(&mut self, c: Vec3, h: f32, uv: [f32; 2], uv_b: [f32; 2], color: [f32; 4]) {
+    pub(crate) fn cube(&mut self, c: Vec3, h: f32, uv: [f32; 2], uv_b: [f32; 2], color: [f32; 4]) {
         let base = self.pos.len() as u32;
         for i in 0..8 {
             let o = Vec3::new(
@@ -134,7 +138,7 @@ impl DotMesh {
         }
     }
 
-    fn into_mesh(mut self) -> Mesh {
+    pub(crate) fn into_mesh(mut self) -> Mesh {
         // Never upload an empty mesh: park one dot far below the floor.
         if self.pos.is_empty() {
             self.cube(
@@ -171,6 +175,7 @@ fn setup(
             MeshMaterial3d(mat.clone()),
             Transform::default(),
             NoFrustumCulling,
+            MachineLayer,
         ));
     }
     commands.insert_resource(CityHandles { city, floor, mat });
@@ -418,6 +423,7 @@ fn update_params(
     quality: Res<Quality>,
     time: Res<Time>,
     handles: Res<CityHandles>,
+    ex: Res<crate::explore::Explore>,
     mut mats: ResMut<Assets<DotsMaterial>>,
 ) {
     let id = |k: Option<ProcKey>| {
@@ -435,7 +441,16 @@ fn update_params(
     };
     let s = &m.snapshot.system;
     let ram = s.mem_used as f32 / s.mem_total.max(1) as f32;
-    mat.params.a = Vec4::new(t, s.kernel_pressure, id(sel.key), id(sel.hovered));
+    mat.params.a = if ex.inside().is_some() {
+        Vec4::new(
+            t,
+            s.kernel_pressure,
+            ex.element_id(ex.element),
+            ex.element_id(ex.hovered),
+        )
+    } else {
+        Vec4::new(t, s.kernel_pressure, id(sel.key), id(sel.hovered))
+    };
     let intensity = if quality.tier == crate::Tier::Low {
         1.2
     } else {
@@ -449,5 +464,105 @@ fn update_params(
     );
     mat.params.c = palette::linear4(palette::DOT_OFF, 0.0);
     let reach = sl.layout.extent;
-    mat.params.d = Vec4::new(reach + 8.0, reach * 1.8 + 26.0, 0.0, 0.0);
+    mat.params.d = if ex.inside().is_some() {
+        Vec4::new(42.0, 95.0, 0.0, 0.0)
+    } else {
+        Vec4::new(reach + 8.0, reach * 1.8 + 26.0, 0.0, 0.0)
+    };
+}
+
+/// The builder for dot meshes, shared with the interior.
+pub(crate) type DotMeshBuilder = DotMesh;
+
+fn element_kind(h: Health) -> f32 {
+    match h {
+        Health::Critical => KIND_CRITICAL,
+        Health::Warning => KIND_WATCH,
+        Health::Healthy => KIND_PROCESS,
+    }
+}
+
+/// The world inside one process, as dots (see `interior.rs`).
+pub(crate) fn interior_mesh(
+    it: &Interior,
+    d: &bw_model::ProcessDetail,
+    snap: &bw_model::Snapshot,
+    born: f32,
+    _now: f32,
+) -> Mesh {
+    use std::f32::consts::TAU;
+    let mut m = DotMesh::default();
+    for (i, e) in it.elements.iter().enumerate() {
+        let id = (ELEMENT_ID_BASE + i) as f32;
+        let rgb = interior::health_rgb(e.health);
+        let kind = element_kind(e.health);
+        let b = born + i as f32 * 0.003;
+        let col = [rgb[0], rgb[1], rgb[2], b];
+        match &e.kind {
+            ElementKind::Stratum { region } => {
+                let r = &d.regions[*region];
+                let levels = ((e.max.y - e.min.y) / LEVEL_H).round().max(1.0) as usize;
+                for lv in 0..levels {
+                    let y = e.min.y + lv as f32 * LEVEL_H + 0.05;
+                    for k in 0..48 {
+                        if !interior::stratum_keep(r.kind, k, lv) {
+                            continue;
+                        }
+                        let ang = k as f32 / 48.0 * TAU + lv as f32 * 0.013;
+                        let pos = Vec3::new(
+                            ang.cos() * interior::CORE_R,
+                            y,
+                            ang.sin() * interior::CORE_R,
+                        );
+                        m.cube(
+                            pos,
+                            0.045,
+                            [0.12, lv as f32 / levels as f32],
+                            [id, kind],
+                            col,
+                        );
+                    }
+                }
+            }
+            ElementKind::Floor { thread } => {
+                let t = &d.threads[*thread];
+                let cpu = (t.cpu_pct / 100.0).clamp(0.0, 1.0).sqrt();
+                let y = e.anchor.y;
+                let h = interior::PLATE;
+                let corners = [
+                    Vec3::new(-h, y, -h),
+                    Vec3::new(h, y, -h),
+                    Vec3::new(h, y, h),
+                    Vec3::new(-h, y, h),
+                    Vec3::new(-h, y, -h),
+                ];
+                interior::along(&corners, 0.3, |p, u| {
+                    m.cube(p, 0.05, [cpu, u], [id, kind], col)
+                });
+            }
+            ElementKind::Conduit { .. } => {
+                interior::along(&e.path, 0.32, |p, u| {
+                    m.cube(p, 0.035, [0.3, u], [id, KIND_FLOW], col)
+                });
+            }
+            ElementKind::Satellite { child } => {
+                if let Some(c) = snap.processes.get(child) {
+                    let base = (e.min + e.max) * 0.5;
+                    let column = crate::layout::Column {
+                        key: c.key,
+                        base: Vec3::new(base.x, 0.0, base.z),
+                        footprint: crate::layout::footprint(c),
+                        levels: crate::layout::levels(c),
+                        realm: c.realm,
+                    };
+                    let (crgb, ckind, cpu) = process_look(c, c.realm);
+                    column_dots(&mut m, ELEMENT_ID_BASE + i, &column, crgb, ckind, cpu, b);
+                }
+                interior::along(&e.path, 0.4, |p, u| {
+                    m.cube(p, 0.03, [0.1, u], [id, KIND_FLOW], col)
+                });
+            }
+        }
+    }
+    m.into_mesh()
 }

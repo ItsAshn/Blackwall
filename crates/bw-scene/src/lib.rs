@@ -5,6 +5,8 @@
 
 pub mod camera;
 mod city;
+pub mod explore;
+pub mod interior;
 pub mod layout;
 pub mod nav;
 pub mod palette;
@@ -41,6 +43,9 @@ pub struct Machine {
     pub mem_history: HashMap<ProcKey, VecDeque<f32>>,
     /// (cpu %, mem %, kernel pressure) per sample.
     pub sys_history: VecDeque<[f32; 3]>,
+    /// Internals of the process being explored, and a counter bumped on each.
+    pub detail: Option<bw_model::ProcessDetail>,
+    pub detail_gen: u64,
     /// Keys born / died in the last update, for materialize/dissolve effects.
     pub born: Vec<ProcKey>,
     pub died: Vec<ProcKey>,
@@ -158,6 +163,7 @@ impl Plugin for ScenePlugin {
             )
             .add_systems(Update, ingest.in_set(SceneSet::Ingest))
             .add_systems(Update, update_layout.in_set(SceneSet::Layout));
+        explore::plugin(app);
         wall::plugin(app);
         city::plugin(app);
         visuals::plugin(app);
@@ -188,6 +194,11 @@ fn ingest(rx: Option<Res<SourceRx>>, mut m: ResMut<Machine>) {
                 m.born.extend(s.processes.keys().copied());
                 m.snapshot = *s;
                 m.received = true;
+            }
+            Update::Detail(d) => {
+                m.detail = Some(*d);
+                m.detail_gen += 1;
+                continue;
             }
             Update::Delta(d) => {
                 for p in &d.upserted {
@@ -252,4 +263,16 @@ fn update_layout(
         layout, targets, ..
     } = &mut *sl;
     layout.positions(targets);
+}
+
+/// Bytes as megabytes or gigabytes, for in-world labels.
+pub fn fmt_mb(b: u64) -> String {
+    let mb = b as f64 / 1_048_576.0;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else if mb >= 10.0 {
+        format!("{mb:.0} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
 }

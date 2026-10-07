@@ -7,8 +7,8 @@
 //! best available kernel-pressure signal.
 
 use bw_model::{
-    Capabilities, HostInfo, Interface, Owner, ProcKey, ProcState, Process, Realm, Snapshot,
-    SystemStats, Volume,
+    Capabilities, HostInfo, Interface, Owner, ProcKey, ProcState, Process, ProcessDetail, Realm,
+    Snapshot, SystemStats, Volume,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +34,12 @@ mod os;
 pub trait Collector: Send {
     fn capabilities(&self) -> Capabilities;
     fn sample(&mut self) -> Snapshot;
+    /// Internals of one process (threads, memory map, descriptors), for the
+    /// process being explored. Collected on demand: it is far more expensive
+    /// than a sample.
+    fn detail(&mut self, _key: ProcKey) -> Option<ProcessDetail> {
+        None
+    }
 }
 
 /// The cross-platform collector: `sysinfo` plus per-OS refinements.
@@ -45,6 +51,12 @@ pub struct SysCollector {
     host: HostInfo,
     my_uid: Option<String>,
     os: os::State,
+    /// Per-thread CPU ticks of the process being explored, and when they were read.
+    detail_ticks: (
+        Option<ProcKey>,
+        HashMap<u32, u64>,
+        Option<std::time::Instant>,
+    ),
 }
 
 impl Default for SysCollector {
@@ -80,6 +92,7 @@ impl SysCollector {
             host,
             my_uid,
             os: os::State,
+            detail_ticks: (None, HashMap::new(), None),
         }
     }
 
@@ -144,6 +157,29 @@ pub fn link_parents(raw: &HashMap<u32, (ProcKey, Option<u32>)>) -> HashMap<u32, 
 impl Collector for SysCollector {
     fn capabilities(&self) -> Capabilities {
         os::capabilities()
+    }
+
+    fn detail(&mut self, key: ProcKey) -> Option<ProcessDetail> {
+        let (last_key, ticks, at) = &mut self.detail_ticks;
+        if *last_key != Some(key) {
+            *last_key = Some(key);
+            ticks.clear();
+            *at = None;
+        }
+        let elapsed = at.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        *at = Some(std::time::Instant::now());
+        let exe = self
+            .sys
+            .process(Pid::from_u32(key.pid))
+            .and_then(|p| p.exe())
+            .map(|e| e.to_string_lossy().into_owned());
+        let mut d = os::detail(key.pid, exe.as_deref(), ticks, elapsed)?;
+        d.key = Some(key);
+        d.time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        Some(d)
     }
 
     fn sample(&mut self) -> Snapshot {

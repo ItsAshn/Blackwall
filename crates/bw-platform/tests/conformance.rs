@@ -34,3 +34,22 @@ fn sees_this_process_and_sane_values() {
         assert!(p.cpu_pct >= 0.0 && p.cpu_pct.is_finite());
     }
 }
+
+#[test]
+fn detail_of_own_process_where_supported() {
+    let mut c = SysCollector::new();
+    let s = c.sample();
+    if !s.caps.process_detail {
+        return;
+    }
+    let me = s
+        .processes
+        .values()
+        .find(|p| p.key.pid == std::process::id())
+        .expect("own process");
+    let d = c.detail(me.key).expect("detail for own process");
+    assert!(!d.threads.is_empty(), "at least one thread");
+    assert!(!d.regions.is_empty(), "a memory map");
+    assert!(d.fd_count >= 3, "stdin/stdout/stderr at least");
+    assert!(!d.restricted, "own process is never restricted");
+}

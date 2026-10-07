@@ -11,6 +11,7 @@
 //! Character shortcuts use *logical* keys via egui so they follow the user's
 //! keyboard layout; Cmd on macOS / Ctrl elsewhere is `Modifiers::command`.
 
+mod quiet;
 mod theme;
 
 use bevy::prelude::*;
@@ -43,6 +44,10 @@ pub struct UiState {
     pub show_help: bool,
     /// Hide every panel (labels too) for an unobstructed view.
     pub hidden: bool,
+    /// Machine vitals along the top, sparklines along the bottom (V).
+    pub show_vitals: bool,
+    /// The search overlay (/).
+    search_open: bool,
     focus_search: bool,
     styled: bool,
     /// Last frame's HUD column sizes, for the fades painted beneath them.
@@ -56,10 +61,12 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             search: String::new(),
-            show_list: true,
-            show_inspector: true,
+            show_list: false,
+            show_inspector: false,
             show_help: false,
             hidden: false,
+            show_vitals: false,
+            search_open: false,
             focus_search: false,
             styled: false,
             left_w: 0.0,
@@ -125,6 +132,7 @@ fn hud(
     labels: Query<(&WorldLabel, &GlobalTransform, &InheritedVisibility)>,
     nodes: Query<(&ProcNode, &Shown)>,
     ents: Res<ProcEntities>,
+    mut ex: ResMut<bw_scene::explore::Explore>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     if !ui_state.styled {
@@ -159,65 +167,85 @@ fn hud(
     if jack.running() {
         return Ok(());
     }
+    let cam = camera.single().ok();
     if ui_state.hidden {
-        draw_labels!(&root);
+        quiet::fade_overlay(ctx, &ex);
         return Ok(());
     }
 
-    // The scene fades to black beneath each HUD column (last frame's sizes).
+    // Summoned columns; the scene fades to black beneath each.
     let p = root.painter().clone();
     let reach = 70.0;
-    if ui_state.top_h > 0.0 {
-        fade(
-            &p,
-            egui::Rect::from_min_size(
-                screen.min,
-                vec2(screen.width(), ui_state.top_h + reach * 0.5),
-            ),
-            Edge::Top,
-        );
-    }
-    if ui_state.bottom_h > 0.0 {
-        fade(
-            &p,
-            egui::Rect::from_min_max(
-                Pos2::new(
-                    screen.left(),
-                    screen.bottom() - ui_state.bottom_h - reach * 0.5,
+    if ui_state.show_vitals {
+        if ui_state.top_h > 0.0 {
+            fade(
+                &p,
+                egui::Rect::from_min_size(
+                    screen.min,
+                    vec2(screen.width(), ui_state.top_h + reach * 0.5),
                 ),
-                screen.max,
-            ),
-            Edge::Bottom,
-        );
+                Edge::Top,
+            );
+        }
+        if ui_state.bottom_h > 0.0 {
+            fade(
+                &p,
+                egui::Rect::from_min_max(
+                    Pos2::new(
+                        screen.left(),
+                        screen.bottom() - ui_state.bottom_h - reach * 0.5,
+                    ),
+                    screen.max,
+                ),
+                Edge::Bottom,
+            );
+        }
+        ui_state.top_h = top_bar(&mut root, &m, &mut quality, &mut settings, &mut ui_state);
+        ui_state.bottom_h = bottom_bar(&mut root, &m, &settings, &floor);
+    } else {
+        quiet::breadcrumb(ctx, &m, &sel, &ex);
     }
-    if ui_state.show_list && ui_state.left_w > 0.0 {
-        fade(
-            &p,
-            egui::Rect::from_min_size(screen.min, vec2(ui_state.left_w + reach, screen.height())),
-            Edge::Left,
-        );
-    }
-    if ui_state.show_inspector && ui_state.right_w > 0.0 {
-        fade(
-            &p,
-            egui::Rect::from_min_max(
-                Pos2::new(screen.right() - ui_state.right_w - reach, screen.top()),
-                screen.max,
-            ),
-            Edge::Right,
-        );
-    }
-
-    ui_state.top_h = top_bar(&mut root, &m, &mut quality, &mut settings, &mut ui_state);
-    ui_state.bottom_h = bottom_bar(&mut root, &m, &settings, &floor);
     if ui_state.show_list {
+        if ui_state.left_w > 0.0 {
+            fade(
+                &p,
+                egui::Rect::from_min_size(
+                    screen.min,
+                    vec2(ui_state.left_w + reach, screen.height()),
+                ),
+                Edge::Left,
+            );
+        }
         ui_state.left_w = process_list(&mut root, &m, &mut sel, &mut ui_state, sel_changed);
     }
     if ui_state.show_inspector {
-        ui_state.right_w = inspector(&mut root, &m, &mut sel, &sl);
+        if ui_state.right_w > 0.0 {
+            fade(
+                &p,
+                egui::Rect::from_min_max(
+                    Pos2::new(screen.right() - ui_state.right_w - reach, screen.top()),
+                    screen.max,
+                ),
+                Edge::Right,
+            );
+        }
+        ui_state.right_w = if ex.inside().is_some() {
+            element_inspector(&mut root, &m, &mut ex)
+        } else {
+            inspector(&mut root, &m, &mut sel, &sl)
+        };
     }
-    // Labels go in the space the HUD columns leave, never beneath them.
-    draw_labels!(&root);
+    if ex.inside().is_none() {
+        draw_labels!(&root);
+    }
+    if let Some((camera, cam_tf)) = cam {
+        quiet::whisper(ctx, camera, cam_tf, &m, &sel, &ex, &sl);
+        quiet::compass(ctx, camera, cam_tf, &ex);
+    }
+    if !ui_state.show_vitals {
+        quiet::hint(ctx, &ex, &sel);
+    }
+    quiet::search(ctx, &mut ui_state, &m, &mut sel, &mut ex);
     if ui_state.show_help {
         help_window(ctx, &mut ui_state);
     }
@@ -232,6 +260,7 @@ fn hud(
                 );
             });
     }
+    quiet::fade_overlay(ctx, &ex);
     Ok(())
 }
 
@@ -245,15 +274,18 @@ fn shortcuts(
     let typing = ctx.egui_wants_keyboard_input();
     ctx.input(|i| {
         if i.modifiers.command && i.key_pressed(egui::Key::K) {
+            st.search_open = true;
             st.focus_search = true;
-            st.show_list = true;
         }
         if typing {
             return;
         }
         if i.key_pressed(egui::Key::Slash) {
+            st.search_open = true;
             st.focus_search = true;
-            st.show_list = true;
+        }
+        if i.key_pressed(egui::Key::V) {
+            st.show_vitals = !st.show_vitals;
         }
         if i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1) {
             st.show_help = !st.show_help;
@@ -264,7 +296,7 @@ fn shortcuts(
         if i.key_pressed(egui::Key::L) {
             st.show_list = !st.show_list;
         }
-        if i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::I) {
+        if i.key_pressed(egui::Key::I) {
             st.show_inspector = !st.show_inspector;
         }
         if i.key_pressed(egui::Key::Num1) {
@@ -753,62 +785,8 @@ fn world_labels(
             painter.galley(rect.min + vec2(2.0, 2.0), galley, color);
         }
     }
-    // Name the busiest processes, plus the selected and hovered ones. Bare
-    // text on black; selected and hovered get an outline and win overlaps.
-    let mut top: Vec<&Process> = m
-        .snapshot
-        .processes
-        .values()
-        .filter(|p| p.realm == Realm::User)
-        .collect();
-    top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
-    let keys: Vec<_> = top.iter().take(8).map(|p| p.key).collect();
-    let mut ordered: Vec<_> = sel.key.into_iter().chain(sel.hovered).collect();
-    ordered.extend(keys);
-    for k in ordered {
-        let Some((_, shown)) = ents.0.get(&k).and_then(|e| nodes.get(*e).ok()) else {
-            continue;
-        };
-        let Some(p) = m.snapshot.processes.get(&k) else {
-            continue;
-        };
-        let Some(pos) = project(shown.pos + Vec3::Y * (shown.radius + 0.4)) else {
-            continue;
-        };
-        let strong = Some(k) == sel.key || Some(k) == sel.hovered;
-        let text = format!("{}  {:.0}%", truncate(&p.name, 22), p.cpu_pct);
-        let galley = painter.layout_no_wrap(
-            text.clone(),
-            font.clone(),
-            if strong { SELECT } else { SIGNAL },
-        );
-        let rect = egui::Align2::CENTER_BOTTOM
-            .anchor_size(pos, galley.size())
-            .expand(3.0);
-        if placed.iter().any(|r| r.intersects(rect)) {
-            continue;
-        }
-        placed.push(rect);
-        if strong {
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(1.0, SELECT),
-                egui::StrokeKind::Outside,
-            );
-            glow_text(
-                painter,
-                rect.min + vec2(3.0, 3.0),
-                egui::Align2::LEFT_TOP,
-                &text,
-                font.clone(),
-                SELECT,
-                OK,
-            );
-        } else {
-            painter.galley(rect.min + vec2(3.0, 3.0), galley, SIGNAL);
-        }
-    }
+    // Process names come from the whisper (quiet.rs): one at a time, never a crowd.
+    let _ = (m, sel, nodes, ents, &mut placed);
 }
 
 fn help_window(ctx: &egui::Context, st: &mut UiState) {
@@ -877,4 +855,136 @@ fn spark_labeled(ui: &mut Ui, name: &str, v: &[f32], max: f32, c: Color32) {
             ui.label(RichText::new(txt).size(10.0).color(c));
         }
     });
+}
+
+/// The inspector inside a process: the chosen part, then the anomalies.
+fn element_inspector(root: &mut Ui, m: &Machine, ex: &mut bw_scene::explore::Explore) -> f32 {
+    use bw_scene::interior::ElementKind;
+    egui::Panel::right("inspector")
+        .frame(bare_frame(14, 8))
+        .show_separator_line(false)
+        .default_size(330.0)
+        .resizable(true)
+        .show(root, |ui| {
+            let Some(p) = ex.inside().and_then(|k| m.snapshot.processes.get(&k)) else {
+                return;
+            };
+            ui.label(label("INSIDE"));
+            ui.label(RichText::new(&p.name).font(semibold(16.0)).color(SELECT));
+            if let Some(d) = &ex.detail {
+                ui.label(
+                    RichText::new(format!(
+                        "{} threads · {} regions · {} descriptors",
+                        d.threads.len(),
+                        d.regions.len(),
+                        d.fd_count
+                    ))
+                    .size(10.0)
+                    .color(SIGNAL_DIM),
+                );
+                if d.restricted {
+                    ui.label(
+                        RichText::new("Some of it is hidden by the OS (another user's process).")
+                            .size(10.0)
+                            .color(SIGNAL_DIM),
+                    );
+                }
+            } else {
+                ui.label(
+                    RichText::new("reading its internals…")
+                        .size(10.0)
+                        .color(SIGNAL_DIM),
+                );
+            }
+            ui.add_space(10.0);
+            if let (Some(e), Some(d)) = (
+                ex.element
+                    .and_then(|i| ex.interior.elements.get(i))
+                    .cloned(),
+                ex.detail.clone(),
+            ) {
+                let row = |ui: &mut Ui, k: &str, v: String| {
+                    ui.label(label(k));
+                    ui.label(RichText::new(v).size(12.0).color(SIGNAL));
+                    ui.end_row();
+                };
+                egui::Grid::new("element")
+                    .num_columns(2)
+                    .spacing(vec2(12.0, 4.0))
+                    .show(ui, |ui| match &e.kind {
+                        ElementKind::Floor { thread } => {
+                            let t = &d.threads[*thread];
+                            row(ui, "THREAD", t.name.clone());
+                            row(ui, "TID", t.tid.to_string());
+                            row(ui, "STATE", format!("{:?}", t.state).to_lowercase());
+                            row(ui, "CPU", format!("{:.1}%", t.cpu_pct));
+                        }
+                        ElementKind::Stratum { region } => {
+                            let r = &d.regions[*region];
+                            row(ui, "MEMORY", r.label.clone());
+                            row(ui, "KIND", format!("{:?}", r.kind).to_lowercase());
+                            row(ui, "SIZE", fmt_bytes(r.size_bytes));
+                        }
+                        ElementKind::Conduit { fd } => {
+                            let f = &d.fds[*fd];
+                            row(ui, "DESCRIPTOR", f.fd.to_string());
+                            row(ui, "KIND", format!("{:?}", f.kind).to_lowercase());
+                            row(ui, "TARGET", truncate(&f.target, 60));
+                        }
+                        ElementKind::Satellite { child } => {
+                            if let Some(c) = m.snapshot.processes.get(child) {
+                                row(ui, "CHILD", c.name.clone());
+                                row(ui, "PID", c.key.pid.to_string());
+                                row(ui, "CPU", format!("{:.1}%", c.cpu_pct));
+                                row(ui, "MEMORY", fmt_bytes(c.mem_bytes));
+                            }
+                        }
+                    });
+                if let Some(a) = &e.anomaly {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(a).font(semibold(12.0)).color(
+                        if e.health == Health::Critical {
+                            ISSUE
+                        } else {
+                            WATCH
+                        },
+                    ));
+                }
+                ui.add_space(10.0);
+            }
+            ui.label(label(&format!("ANOMALIES ({})", ex.anomalies.len())));
+            let list: Vec<(usize, String, Health)> = ex
+                .anomalies
+                .iter()
+                .filter_map(|a| {
+                    ex.interior
+                        .elements
+                        .iter()
+                        .position(|e| e.kind == a.element)
+                        .map(|i| (i, a.text.clone(), a.health))
+                })
+                .collect();
+            if list.is_empty() {
+                ui.label(
+                    RichText::new("none found yet; growth needs a few samples")
+                        .size(10.0)
+                        .color(SIGNAL_DIM),
+                );
+            }
+            for (i, text, h) in list {
+                let c = if h == Health::Critical { ISSUE } else { WATCH };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(truncate(&text, 44)).size(11.0).color(c))
+                            .frame(false),
+                    )
+                    .clicked()
+                {
+                    ex.choose(Some(i));
+                }
+            }
+        })
+        .response
+        .rect
+        .width()
 }

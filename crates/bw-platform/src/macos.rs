@@ -33,3 +33,14 @@ pub fn is_kernel_side(pid: u32, name: &str, _p: &Process) -> bool {
 pub fn is_system_account(uid: &str, name: Option<&str>) -> bool {
     uid.parse::<u32>().map(|u| u < 500).unwrap_or(false) || name.is_some_and(|n| n.starts_with('_'))
 }
+
+/// Process internals are Linux-only for now (Milestone 6 adds Toolhelp
+/// thread snapshots and VirtualQueryEx on Windows, proc_pidinfo on macOS).
+pub fn detail(
+    _pid: u32,
+    _exe: Option<&str>,
+    _ticks: &mut std::collections::HashMap<u32, u64>,
+    _elapsed: f32,
+) -> Option<bw_model::ProcessDetail> {
+    None
+}

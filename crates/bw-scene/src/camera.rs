@@ -187,13 +187,6 @@ fn mouse_touch_input(
         cam.t_pitch = (cam.t_pitch + d.y * 0.004).clamp(-1.2, 1.45);
         active = true;
     }
-    if (buttons.pressed(MouseButton::Right) || buttons.pressed(MouseButton::Middle))
-        && d != Vec2::ZERO
-    {
-        pan(&mut cam, d);
-        sel.follow = false;
-        active = true;
-    }
     if scroll.delta.y != 0.0 {
         let step = match scroll.unit {
             MouseScrollUnit::Line => scroll.delta.y * 0.12,
@@ -246,45 +239,15 @@ fn keyboard_input(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     block: Res<InputBlock>,
-    sl: Res<SceneLayout>,
     mut cam: ResMut<OrbitCam>,
-    mut sel: ResMut<Selection>,
 ) {
     if block.keyboard {
         return;
     }
     let dt = time.delta_secs();
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let mut active = keys.get_just_pressed().next().is_some();
+    let active = keys.get_just_pressed().next().is_some();
 
-    // WASD pans across the plane, relative to the view direction.
-    let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
-    let right = Vec3::new(cam.yaw.cos(), 0.0, -cam.yaw.sin());
-    let mut mv = Vec3::ZERO;
-    if keys.pressed(KeyCode::KeyW) {
-        mv += fwd;
-    }
-    if keys.pressed(KeyCode::KeyS) {
-        mv -= fwd;
-    }
-    if keys.pressed(KeyCode::KeyD) {
-        mv += right;
-    }
-    if keys.pressed(KeyCode::KeyA) {
-        mv -= right;
-    }
-    if keys.pressed(KeyCode::KeyR) {
-        mv += Vec3::Y;
-    }
-    if keys.pressed(KeyCode::KeyF) && shift {
-        mv -= Vec3::Y;
-    }
-    if mv != Vec3::ZERO {
-        let step = mv.normalize() * cam.dist * 0.8 * dt;
-        cam.t_focus += step;
-        sel.follow = false;
-        active = true;
-    }
     // Shift + arrows orbit (plain arrows walk the process tree, see nav.rs).
     if shift {
         let mut o = Vec2::ZERO;
@@ -311,13 +274,6 @@ fn keyboard_input(
     if zoom != 0 {
         cam.t_dist = (cam.t_dist * (1.0 - zoom as f32 * dt * 1.5)).clamp(2.0, 2000.0);
     }
-    if keys.just_pressed(KeyCode::Home) {
-        sel.follow = false;
-        cam.frame_all(sl.layout.extent);
-    }
-    if keys.just_pressed(KeyCode::KeyF) && !shift {
-        sel.follow = !sel.follow;
-    }
     if active {
         cam.idle = 0.0;
     }
@@ -328,17 +284,13 @@ fn follow_and_apply(
     time: Res<Time>,
     m: Res<Machine>,
     sl: Res<SceneLayout>,
-    sel: Res<Selection>,
     settings: Res<SceneSettings>,
-    ents: Res<ProcEntities>,
-    shown: Query<&Shown>,
     mut cam: ResMut<OrbitCam>,
     mut jack: ResMut<JackIn>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     mut tf: Query<&mut Transform, With<MainCamera>>,
-    mut last_sel: Local<Option<ProcKey>>,
 ) {
     let dt = time.delta_secs();
     if m.received && !cam.framed && sl.layout.extent > 0.0 {
@@ -387,19 +339,6 @@ fn follow_and_apply(
         }
     }
     cam.idle += dt;
-    if let Some(s) = sel
-        .key
-        .and_then(|k| ents.0.get(&k))
-        .and_then(|e| shown.get(*e).ok())
-    {
-        if sel.follow {
-            cam.t_focus = s.pos;
-        }
-        if *last_sel != sel.key {
-            cam.t_dist = (s.radius * 12.0 + 7.0).clamp(6.0, 40.0);
-        }
-    }
-    *last_sel = sel.key;
     // Idle drift: a slow orbit when nobody has touched anything for a while.
     if cam.idle > 45.0 && !settings.reduced_motion {
         cam.t_yaw += dt * 0.03;
@@ -410,6 +349,9 @@ fn follow_and_apply(
     cam.pitch += (cam.t_pitch - cam.pitch) * k;
     cam.dist += (cam.t_dist - cam.dist) * (1.0 - (-dt * 3.0).exp());
     if let Ok(mut t) = tf.single_mut() {
-        *t = Transform::from_translation(cam.eye()).looking_at(cam.focus, Vec3::Y);
+        // Never below the floor: looking up at a tower stands you on it.
+        let mut eye = cam.eye();
+        eye.y = eye.y.max(0.25);
+        *t = Transform::from_translation(eye).looking_at(cam.focus, Vec3::Y);
     }
 }
