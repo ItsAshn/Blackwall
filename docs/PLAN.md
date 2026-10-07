@@ -2,6 +2,8 @@
 
 > A cyberpunk system visualizer. User space is **Deep Space**: a dark void where processes drift as living entities. The **Blackwall** is the kernel/user boundary: a vast luminous barrier, with the kernel's machinery humming behind it. You can drift through it as ambient art, then drill into any entity for real, actionable diagnostics.
 >
+> **v2.1:** no paid code-signing certificates; see §3.7 and §7.
+>
 > **v2 change:** The whole application is native Rust. Bevy renders the scene and egui provides the data panels. Tauri and the web frontend are gone. Cross-platform compatibility is now a first-class design constraint (§3).
 
 ---
@@ -105,15 +107,29 @@ Cross-platform compatibility is built in from the start, not ported later.
 - **Fonts are bundled** (a monospace and a display face, plus Noto fallbacks for CJK and symbols), so rendering is identical on every OS.
 - Process names and paths are not always valid UTF-8 (Linux bytes, Windows UTF-16 with unpaired surrogates). Store them raw and display them lossily. Search matches on the lossy form.
 
-### 3.7 Packaging and distribution
-| OS | Formats | Signing / notes |
-|---|---|---|
-| Windows | MSI (`cargo-wix`) and a portable zip; winget later | **Code-sign** (Authenticode, e.g. Azure Trusted Signing). An unsigned binary that inspects and kills processes is likely to be flagged by antivirus |
-| macOS | `.app` in a DMG, universal2 | **Developer ID signing and notarization** (requires a paid Apple Developer account). The privileged helper (SMAppService) *requires* a signed app |
-| Linux | AppImage, `.deb` (`cargo-deb`), `.rpm` (`cargo-generate-rpm`), AUR | **No Flatpak or Snap for v1**: their sandboxes hide host processes, which defeats a system monitor. Revisit later with a host-side helper |
+### 3.7 Packaging, distribution and signing — **zero paid certificates**
 
-- **Build glibc compatibility:** build Linux release binaries in an old-glibc container (or with `cargo-zigbuild` targeting glibc 2.31).
-- **Updates:** at first, through package managers and GitHub Releases. A self-updater with signed manifests (e.g. minisign) comes later.
+**Constraint:** no Apple Developer Program fee and no paid Windows code-signing certificate. The strategy is to (1) use the free signing that exists, (2) ship through channels that never mark files as "downloaded from the internet", and (3) give users free, verifiable provenance instead of a paid publisher identity.
+
+| OS | What's blocked without a paid identity | How we get around it |
+|---|---|---|
+| **Windows** | Unsigned downloads show a SmartScreen "Windows protected your PC" prompt; UAC shows "Unknown publisher"; antivirus heuristics are stricter | **Primary:** apply to the **SignPath Foundation** free open-source code-signing program once the first release is public. It needs an OSI license, a public repository and a fully automated CI build, all of which we have. **Until then:** distribute through **Scoop**, **winget** and `cargo install`. These download outside the browser, so no SmartScreen prompt on first run. Direct zip/MSI downloads document "More info → Run anyway". **Antivirus hygiene:** no UPX or other packers; embedded version info and manifest; symbols shipped separately; submit every release to Microsoft's free false-positive portal |
+| **macOS** | No notarization, so Gatekeeper blocks *quarantined* apps. Since macOS 15 the right-click → Open bypass is gone; users must go to **System Settings → Privacy & Security → Open Anyway**. Homebrew **casks** that fail Gatekeeper are disabled from **1 Sept 2026** | **Ad-hoc sign** everything (`codesign --force --options runtime -s -`). This is free and required for arm64; `--options runtime` (hardened runtime) also blocks `DYLD_` library injection into our binaries. **Channels that never quarantine:** (a) our own **Homebrew tap with a *formula*** (not a cask), which builds from source or pours a bottle fetched with curl; (b) `cargo install blackwall`; (c) a `curl … | sh` installer (curl does not set the quarantine attribute) that verifies a checksum and minisign signature before installing. **Direct DMG download** stays available, with documented Open Anyway / `xattr -dr com.apple.quarantine` steps |
+| **Linux** | Nothing: Linux needs no code signing | AppImage, `.deb` (`cargo-deb`), `.rpm` (`cargo-generate-rpm`), **AUR**, and an apt/rpm repository on the free **openSUSE Build Service**. **No Flatpak or Snap for v1**: their sandboxes hide host processes, which defeats a system monitor |
+
+**Free provenance on every OS** (in place of a paid publisher identity):
+- `SHA256SUMS` plus a **minisign** signature on every release (key in the repo and README).
+- **GitHub artifact attestations** (`actions/attest-build-provenance`, free for public repos) and **Sigstore cosign keyless** signatures. Anyone can verify that a binary was built by this repo's CI from a given commit.
+- Reproducible-build settings (`--locked`, `SOURCE_DATE_EPOCH`, path remapping) so third parties can rebuild and compare.
+
+**Ad-hoc signing side effects on macOS:**
+- Ad-hoc signatures change with every build. **Privacy permissions (TCC) granted to one build don't carry over to the next.** Blackwall is therefore designed to **need no TCC permissions** (no Full Disk Access, screen recording or accessibility control). Anything TCC-gated is optional and labeled as such.
+- The helper can't use XPC code-signing requirements or SMAppService, so it uses on-demand elevation instead (§7).
+
+**Other packaging notes:**
+- **glibc compatibility:** build Linux release binaries in an old-glibc container (or with `cargo-zigbuild` targeting glibc 2.31).
+- **Updates:** through the package managers above. A later self-updater verifies the minisign signature, so it doesn't depend on OS code signing.
+- **macOS universal2:** after merging with `lipo`, re-sign the bundle ad-hoc, because `lipo` invalidates per-slice signatures.
 
 ### 3.8 Special environments
 - **Containers / WSL2:** detect them. Inside a container we only see its own process namespace; show a banner saying so. WSL2 sees the Linux VM, not the Windows host, so the banner points to the native Windows build.
@@ -151,8 +167,8 @@ Cross-platform compatibility is built in from the start, not ported later.
 └─────────────────┼───────────────────────────────────────────────────────────────────────────────────┘
                   ▼ authenticated local IPC (Unix socket / named pipe / XPC)
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ blackwall-ice (privileged helper) — allowlisted actions + optional elevated READ probes + audit log │
-│ Linux: systemd unit + polkit │ Windows: service │ macOS: SMAppService daemon                         │
+│ blackwall-ice (elevated session) — allowlisted actions + optional elevated READ probes + audit log  │
+│ launched on demand: pkexec (Linux) │ UAC runas (Windows) │ admin auth prompt (macOS); exits with app │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -251,12 +267,19 @@ If the user opts in, `blackwall-ice` runs these probes elevated and streams **re
 ## 7. Actions and security
 
 1. **Privilege separation.** The app is never elevated. `blackwall-ice` runs a **fixed allowlist of typed operations**: no shell, and no arbitrary commands.
-2. **Per-OS helper installation and authentication**:
-   | OS | Helper | Who may connect |
-   |---|---|---|
-   | Linux | systemd system service, Unix socket | `SO_PEERCRED` plus a **polkit** check per action class. On non-systemd distros, a setuid-free fallback via `pkexec` per action |
-   | Windows | Windows service, named pipe | Pipe ACL; verify the client process's image path and Authenticode signature |
-   | macOS | **SMAppService** launch daemon, XPC | Code-signing requirement check on the connecting client |
+2. **On-demand elevation, no installed service and no signing needed.** Persistent privileged helpers (SMAppService, signed Windows services with Authenticode client checks) depend on paid signing identities, so the default is an **elevated session**:
+   - The user clicks *Elevate* (or triggers an action that needs it). Blackwall launches `blackwall-ice --session` through the OS's own consent prompt:
+
+     | OS | Consent mechanism | Works unsigned? |
+     |---|---|---|
+     | Linux | `pkexec` (polkit), with a polkit policy file installed by the package; `sudo` fallback | ✅ |
+     | Windows | `ShellExecuteExW` with the `runas` verb (UAC prompt; shows "Unknown publisher" until SignPath) | ✅ |
+     | macOS | Authorization Services admin-rights prompt, launched via `osascript … with administrator privileges` | ✅ |
+   - **Authentication without code signatures:** the app creates a random 256-bit session secret and a private IPC endpoint (a Unix socket in a `0700` directory, or a named pipe whose ACL allows only the current user's SID). It hands the secret to the elevated process through a file readable only by the user, deleted on first read. The helper verifies the secret, then the **peer credentials**: `SO_PEERCRED` on Linux, `getpeereid`/`LOCAL_PEERPID` on macOS, `GetNamedPipeClientProcessId` + token SID on Windows.
+   - The session **ends when the app exits** (the helper watches the parent PID and the pipe) or after an idle timeout. There is no root process left running in the background.
+   - Only one consent prompt per session. Destructive tier-2/3 actions still get an in-app typed confirmation.
+   - **Threat model, stated honestly:** this protects against other users and non-admin accounts. Malware already running as the same admin user could also trigger an OS consent prompt, so we don't claim to stop it; the prompt and audit log make abuse visible.
+   - **Optional persistent mode (later):** for always-on elevated collection, `sudo blackwall-ice install` registers a systemd unit, a `/Library/LaunchDaemons` plist or a Windows service. All three work unsigned when installed by an administrator. Authentication then uses the peer-credential checks above plus a polkit / admin-group membership check per action class.
 3. **Action tiers and platform support**:
    | Tier | Action | Linux | Windows | macOS |
    |---|---|---|---|---|
@@ -360,11 +383,11 @@ Sizes: **S** ≈ a few evenings, **M** ≈ 2–3 weekends, **L** ≈ a month or 
 | **4** | **History & replay** | M | Bundled SQLite store with downsampling; `ReplaySource`; timeline; `.bwcap` export/import (and used as test fixtures) |
 | **5** | **Issues: rules** | M | TOML rules engine with capability gating; journald/kmsg, Event Log, and unified log/crash-report readers; alert feed; glitch visuals; fly-to-issue |
 | **6** | **Platform depth** | L | Deeper per-OS probes (PSI/vmstat, PDH, `host_statistics64`), SMART and temperatures where available, published capability matrix |
-| **7** | **ICE helper + tier-1 actions** | L | Helper installed and authenticated on each OS (polkit / Windows service / SMAppService), elevated read probes, kill/suspend/priority/reveal, hash-chained audit log, signed builds |
+| **7** | **ICE helper + tier-1 actions** | L | Elevated session on each OS (pkexec / UAC `runas` / Authorization Services) with secret + peer-credential auth, elevated read probes, kill/suspend/priority/reveal, hash-chained audit log |
 | **8** | **Baselines & anomalies** | M | Hour-of-week profiles, novelty detectors, learning period, explanations, "this is normal" feedback |
 | **9** | **Immersion polish** | M | Synthesized sound, screensaver with system-idle detection and sleep inhibit, quality governor, gesture recognizer, reduced-motion, list view |
 | **10** | **Actions tiers 2–3** | M | Service control (systemd/SCM/launchd); firewall blocks (nftables/WFP/pf) with auto-expiry |
-| **11** | **Packaging & release** | M | MSI + winget, notarized universal DMG, AppImage/deb/rpm/AUR, release automation |
+| **11** | **Packaging & release** | M | Scoop + winget + MSI/zip; Homebrew tap formula, curl installer, ad-hoc-signed universal DMG; AppImage/deb/rpm/AUR/OBS; SHA256SUMS + minisign + GitHub attestations + cosign; SignPath application |
 | **12** | **Fleet-ready** | L | Headless `bw-agent` (engine-free crates only), `RemoteSource` over QUIC + mTLS, host switcher. A hub can come after this |
 | Later | eBPF syscall flows, ETW deep tracing, Windows `.scr`, wasm/WebGPU viewer for fleet, self-updater | — | — |
 
@@ -380,8 +403,9 @@ Scheduled engine upgrades are slotted between milestones whenever a new Bevy min
 | Bevy breaking changes | Pinned versions, engine isolated to four crates, deliberate upgrade milestones |
 | GPU and driver diversity (old iGPUs, VMs, RDP, Wayland quirks) | GL-compatible Low tier, software-renderer detection, shader cross-compile in CI, render smoke tests on lavapipe and WARP |
 | Platform data parity (some data missing or privileged on some OSes) | Capability flags, honest "not available / restricted" states, opt-in elevated read probes, capability-gated rules |
-| Antivirus / Gatekeeper distrust of a process-killing tool | Code signing and notarization from Milestone 7; helper allowlist; clear docs |
-| Paid signing requirements (Apple Developer, Windows certificate) | Unsigned dev builds until Milestone 7/11; budget for the certificates before the first public release |
+| Antivirus / SmartScreen / Gatekeeper distrust of an unsigned process-killing tool | No paid certificates (§3.7): SignPath Foundation for Windows; quarantine-free channels (Scoop, winget, Homebrew formula, curl installer, cargo) on Windows and macOS; ad-hoc + hardened runtime on macOS; no packers; false-positive submissions; free provenance (minisign, attestations, cosign) |
+| SignPath application rejected or delayed | Windows still ships through Scoop/winget/cargo; signing is an improvement, not a dependency |
+| Apple tightens Gatekeeper further for ad-hoc apps | Source-build channels (Homebrew formula, cargo) keep working because locally built code isn't quarantined |
 | Linux distro fragmentation | Old-glibc builds, AppImage + deb/rpm, no hard systemd dependency, capability fallbacks |
 | Collector overhead | Tiered cadences, diff-based updates, CI CPU-budget benchmark on all OSes |
 | Visual clutter | Swarms, semantic zoom, filters, issues-only mode |
@@ -393,6 +417,6 @@ Scheduled engine upgrades are slotted between milestones whenever a new Bevy min
 
 1. Name of the helper (`blackwall-ice` is a placeholder).
 2. A disk-usage "terrain" (large directories as landscape): part of the storage view, or a separate deep-dive mode? Scanning is expensive and slow on network drives.
-3. License (MIT/Apache-2.0 dual is the Rust norm).
-4. Are you willing to pay for an Apple Developer account and a Windows signing certificate? These are needed for the full-control features on macOS and for antivirus trust on Windows.
+3. License: **MIT OR Apache-2.0 proposed**. An OSI license is required for the free SignPath signing program, and it matches Bevy and the Rust ecosystem.
+4. ~~Paid signing~~ **Decided: no paid certificates** (§3.7, §7).
 5. Is a WebAssembly/WebGPU viewer for the future fleet hub (phone access) worth keeping on the roadmap?
