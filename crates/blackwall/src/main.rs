@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra]
-//!           [--size WxH] [--select NAME] [--hide-ui]
+//!           [--size WxH] [--select NAME] [--hide-ui] [--no-intro]
 //!           [--screenshot PATH [--after SECONDS]]
 //! ```
 
@@ -23,13 +23,14 @@ struct Args {
     size: (u32, u32),
     select: Option<String>,
     hide_ui: bool,
+    no_intro: bool,
     screenshot: Option<String>,
     after: f32,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--hide-ui] [--screenshot PATH [--after SECONDS]]"
+        "usage: blackwall [--demo] [--interval-ms N] [--quality low|medium|high|ultra] [--size WxH]\n                 [--select NAME] [--hide-ui] [--no-intro] [--screenshot PATH [--after SECONDS]]"
     );
     std::process::exit(2)
 }
@@ -42,6 +43,7 @@ fn parse_args() -> Args {
         size: (1600, 900),
         select: None,
         hide_ui: false,
+        no_intro: false,
         screenshot: None,
         after: 8.0,
     };
@@ -64,6 +66,7 @@ fn parse_args() -> Args {
             }
             "--select" => a.select = Some(val()),
             "--hide-ui" => a.hide_ui = true,
+            "--no-intro" => a.no_intro = true,
             "--screenshot" => a.screenshot = Some(val()),
             "--after" => a.after = val().parse().unwrap_or_else(|_| usage()),
             "-h" | "--help" => usage(),
@@ -103,6 +106,7 @@ fn main() -> AppExit {
         ui.hidden = args.hide_ui;
         ui
     })
+    .insert_resource(bw_scene::camera::JackIn::new(!args.no_intro))
     .insert_resource(LaunchArgs(args.clone()));
 
     if args.select.is_some() {

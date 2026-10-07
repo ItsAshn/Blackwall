@@ -7,6 +7,7 @@ pub mod camera;
 mod city;
 pub mod layout;
 pub mod nav;
+pub mod palette;
 mod pick;
 pub mod quality;
 mod streams;
@@ -18,7 +19,7 @@ use bw_model::{ProcKey, Snapshot, Update};
 use crossbeam_channel::Receiver;
 use std::collections::{HashMap, VecDeque};
 
-pub use city::health_color;
+pub use city::{FloorInfo, health_color};
 pub use layout::{Layout, Subsystem};
 pub use quality::{Quality, Tier};
 
@@ -150,7 +151,7 @@ impl Plugin for ScenePlugin {
             .init_resource::<SceneSettings>()
             .init_resource::<SceneLayout>()
             .init_resource::<ProcEntities>()
-            .insert_resource(ClearColor(Color::srgb(0.004, 0.003, 0.012)))
+            .insert_resource(ClearColor(Color::BLACK))
             .configure_sets(
                 Update,
                 (SceneSet::Ingest, SceneSet::Layout, SceneSet::Visuals).chain(),

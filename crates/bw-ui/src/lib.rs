@@ -1,9 +1,11 @@
-//! Blackwall's HUD: dense, readable egui panels over the 3D scene (PLAN §6.3).
+//! Blackwall's HUD: words floating on pure black over the scene (design
+//! system: HUD). No panels, boxes or dividers; regions are made by position
+//! and space, and the scene fades to black beneath them.
 //!
-//! * top bar: host, source, machine vitals, Wall pressure
+//! * top: the wordmark, machine vitals, Wall pressure
 //! * left: searchable process list
 //! * right: inspector for the selection
-//! * bottom: system sparklines, legend, key hints
+//! * bottom: dotted sparklines, legend, key hints
 //! * world labels projected from the scene
 //!
 //! Character shortcuts use *logical* keys via egui so they follow the user's
@@ -15,10 +17,10 @@ use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass, egui};
 use bw_model::{Health, ProcState, Process, Realm};
-use bw_scene::camera::{InputBlock, MainCamera, OrbitCam};
+use bw_scene::camera::{InputBlock, MainCamera};
 use bw_scene::{
-    LabelKind, Machine, ProcEntities, ProcNode, Quality, SceneLayout, SceneSettings, Selection,
-    Shown, Tier, WorldLabel,
+    FloorInfo, LabelKind, Machine, ProcEntities, ProcNode, Quality, SceneLayout, SceneSettings,
+    Selection, Shown, Tier, WorldLabel,
 };
 use egui::{Color32, Pos2, RichText, Stroke, Ui, UiBuilder, vec2};
 use theme::*;
@@ -43,6 +45,11 @@ pub struct UiState {
     pub hidden: bool,
     focus_search: bool,
     styled: bool,
+    /// Last frame's HUD column sizes, for the fades painted beneath them.
+    left_w: f32,
+    right_w: f32,
+    top_h: f32,
+    bottom_h: f32,
 }
 
 impl Default for UiState {
@@ -55,6 +62,10 @@ impl Default for UiState {
             hidden: false,
             focus_search: false,
             styled: false,
+            left_w: 0.0,
+            right_w: 0.0,
+            top_h: 0.0,
+            bottom_h: 0.0,
         }
     }
 }
@@ -91,6 +102,14 @@ fn fmt_uptime(s: u64) -> String {
     }
 }
 
+fn label(text: &str) -> RichText {
+    RichText::new(text).size(10.0).color(SIGNAL_DIM)
+}
+
+fn value(text: impl Into<String>) -> RichText {
+    RichText::new(text).font(semibold(13.0)).color(SIGNAL)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hud(
     mut contexts: EguiContexts,
@@ -99,8 +118,9 @@ fn hud(
     mut sel: ResMut<Selection>,
     mut settings: ResMut<SceneSettings>,
     mut quality: ResMut<Quality>,
-    mut cam: ResMut<OrbitCam>,
     sl: Res<SceneLayout>,
+    floor: Res<FloorInfo>,
+    jack: Res<bw_scene::camera::JackIn>,
     camera: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
     labels: Query<(&WorldLabel, &GlobalTransform, &InheritedVisibility)>,
     nodes: Query<(&ProcNode, &Shown)>,
@@ -108,43 +128,96 @@ fn hud(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     if !ui_state.styled {
+        // Fonts installed now take effect on egui's next pass; draw nothing
+        // until then, or the custom families aren't bound yet.
         theme::apply(ctx);
         ui_state.styled = true;
+        return Ok(());
     }
     let sel_changed = sel.is_changed();
     shortcuts(ctx, &mut ui_state, &mut settings, &mut sel, &m);
 
+    let screen = ctx.viewport_rect();
     let mut root = Ui::new(
         ctx.clone(),
         "bw-root".into(),
         UiBuilder::new()
             .layer_id(egui::LayerId::background())
-            .max_rect(ctx.viewport_rect()),
+            .max_rect(screen),
     );
+    macro_rules! draw_labels {
+        ($root:expr) => {
+            if settings.show_labels {
+                if let Ok((camera, cam_tf)) = camera.single() {
+                    world_labels($root, camera, cam_tf, &m, &sel, &labels, &nodes, &ents);
+                }
+            }
+        };
+    }
 
+    // Nothing but the rain while jacking in.
+    if jack.running() {
+        return Ok(());
+    }
     if ui_state.hidden {
-        if settings.show_labels
-            && let Ok((camera, cam_tf)) = camera.single()
-        {
-            world_labels(&root, camera, cam_tf, &m, &sel, &labels, &nodes, &ents);
-        }
+        draw_labels!(&root);
         return Ok(());
     }
 
-    top_bar(&mut root, &m, &mut quality, &mut settings, &mut ui_state);
-    bottom_bar(&mut root, &m, &settings);
+    // The scene fades to black beneath each HUD column (last frame's sizes).
+    let p = root.painter().clone();
+    let reach = 70.0;
+    if ui_state.top_h > 0.0 {
+        fade(
+            &p,
+            egui::Rect::from_min_size(
+                screen.min,
+                vec2(screen.width(), ui_state.top_h + reach * 0.5),
+            ),
+            Edge::Top,
+        );
+    }
+    if ui_state.bottom_h > 0.0 {
+        fade(
+            &p,
+            egui::Rect::from_min_max(
+                Pos2::new(
+                    screen.left(),
+                    screen.bottom() - ui_state.bottom_h - reach * 0.5,
+                ),
+                screen.max,
+            ),
+            Edge::Bottom,
+        );
+    }
+    if ui_state.show_list && ui_state.left_w > 0.0 {
+        fade(
+            &p,
+            egui::Rect::from_min_size(screen.min, vec2(ui_state.left_w + reach, screen.height())),
+            Edge::Left,
+        );
+    }
+    if ui_state.show_inspector && ui_state.right_w > 0.0 {
+        fade(
+            &p,
+            egui::Rect::from_min_max(
+                Pos2::new(screen.right() - ui_state.right_w - reach, screen.top()),
+                screen.max,
+            ),
+            Edge::Right,
+        );
+    }
+
+    ui_state.top_h = top_bar(&mut root, &m, &mut quality, &mut settings, &mut ui_state);
+    ui_state.bottom_h = bottom_bar(&mut root, &m, &settings, &floor);
     if ui_state.show_list {
-        process_list(&mut root, &m, &mut sel, &mut ui_state, sel_changed);
+        ui_state.left_w = process_list(&mut root, &m, &mut sel, &mut ui_state, sel_changed);
     }
     if ui_state.show_inspector {
-        inspector(&mut root, &m, &mut sel, &sl);
+        ui_state.right_w = inspector(&mut root, &m, &mut sel, &sl);
     }
-    // Labels go in the space the panels left, so they never show through them.
-    if settings.show_labels
-        && let Ok((camera, cam_tf)) = camera.single()
-    {
-        world_labels(&root, camera, cam_tf, &m, &sel, &labels, &nodes, &ents);
-    }
+    // Labels go in the space the HUD columns leave, never beneath them.
+    draw_labels!(&root);
     if ui_state.show_help {
         help_window(ctx, &mut ui_state);
     }
@@ -152,10 +225,13 @@ fn hud(
         egui::Area::new("connecting".into())
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.label(RichText::new("JACKING IN…").size(28.0).color(CYAN).strong());
+                ui.label(
+                    RichText::new("JACKING IN")
+                        .font(display(28.0))
+                        .color(WALL_CALM),
+                );
             });
     }
-    let _ = &mut cam;
     Ok(())
 }
 
@@ -219,135 +295,160 @@ fn shortcuts(
     }
 }
 
+fn stat(ui: &mut Ui, k: &str, v: impl Into<String>) -> egui::Response {
+    ui.label(label(k));
+    ui.label(value(v))
+}
+
+/// The Wall's color for a pressure, matching the rain (and the meter).
+fn pressure_color(p: f32) -> Color32 {
+    match p {
+        p if p < 0.35 => OK,
+        p if p < 0.9 => WALL_CALM,
+        _ => WALL_HOT,
+    }
+}
+
 fn top_bar(
     root: &mut Ui,
     m: &Machine,
     quality: &mut Quality,
     settings: &mut SceneSettings,
     st: &mut UiState,
-) {
-    egui::Panel::top("top").frame(bar_frame()).show(root, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("◢ BLACKWALL").size(18.0).strong().color(CYAN));
-            let h = &m.snapshot.host;
-            let (badge, color) = match h.source.as_str() {
-                "live" => ("● LIVE", GREEN),
-                "demo" => ("◆ DEMO DATA", AMBER),
-                other => (other, DIM),
-            };
-            ui.label(RichText::new(badge).strong().color(color));
-            ui.label(RichText::new(&h.hostname).color(DIM)).on_hover_text(format!("{}\nkernel {}\n{} · {} CPUs", h.os, h.kernel, h.arch, h.cpu_count));
-            ui.separator();
-            let s = &m.snapshot.system;
-            stat(ui, "CPU", &format!("{:.0}%", s.cpu_pct), heat(s.cpu_pct / 100.0));
-
-            let mem = s.mem_used as f32 / s.mem_total.max(1) as f32;
-            stat(ui, "MEM", &format!("{} / {}", fmt_bytes(s.mem_used), fmt_bytes(s.mem_total)), heat(mem));
-            if s.swap_total > 0 {
-                stat(ui, "SWAP", &fmt_bytes(s.swap_used), heat(s.swap_used as f32 / s.swap_total as f32));
-            }
-            let procs = m.snapshot.processes.values().filter(|p| p.realm == Realm::User).count();
-            let kern = m.snapshot.processes.len() - procs;
-            stat(ui, "PROCS", &format!("{procs} · {kern} kern"), TEXT).on_hover_text(format!("{procs} user-space processes, {kern} kernel-side"));
-            if let Some(l) = s.load_avg {
-                stat(ui, "LOAD", &format!("{:.1}", l[0]), TEXT).on_hover_text(format!("load average 1/5/15 min: {:.2} {:.2} {:.2}", l[0], l[1], l[2]));
-            }
-            stat(ui, "UP", &fmt_uptime(s.uptime_secs), DIM);
-            ui.separator();
-            ui.label(RichText::new("WALL").color(DIM).small());
-            meter(ui, s.kernel_pressure, 90.0, heat(s.kernel_pressure));
-            let src = if m.snapshot.caps.pressure_stall { "PSI" } else { "est." };
-            ui.label(RichText::new(src).color(DIM).small()).on_hover_text(
-                "Kernel pressure drives the Wall's turbulence.\nPSI = Linux pressure-stall information; est. = estimated from CPU and memory on this platform.",
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("?").on_hover_text("Shortcuts (?)").clicked() {
-                    st.show_help = !st.show_help;
+) -> f32 {
+    egui::Panel::top("top")
+        .frame(bare_frame(14, 10))
+        .show_separator_line(false)
+        .show(root, |ui| {
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(150.0, 22.0), egui::Sense::hover());
+                glow_text(ui.painter(), r.left_center(), egui::Align2::LEFT_CENTER, "BLACKWALL", display(20.0), SIGNAL, OK);
+                let h = &m.snapshot.host;
+                match h.source.as_str() {
+                    "live" => ui.label(label("LIVE")),
+                    "demo" => ui.label(RichText::new("DEMO DATA").font(semibold(11.0)).color(SIGNAL)),
+                    other => ui.label(label(other)),
+                };
+                ui.label(RichText::new(&h.hostname).size(11.0).color(SIGNAL_DIM)).on_hover_text(format!("{}\nkernel {}\n{} · {} CPUs", h.os, h.kernel, h.arch, h.cpu_count));
+                ui.add_space(12.0);
+                let s = &m.snapshot.system;
+                stat(ui, "CPU", format!("{:.0}%", s.cpu_pct));
+                stat(ui, "MEM", format!("{} / {}", fmt_bytes(s.mem_used), fmt_bytes(s.mem_total)));
+                if s.swap_total > 0 {
+                    stat(ui, "SWAP", fmt_bytes(s.swap_used));
                 }
-                ui.menu_button("VIEW", |ui| {
-                    ui.checkbox(&mut settings.show_links, "1  Tree links");
-                    ui.checkbox(&mut settings.show_kernel, "2  Kernel side");
-                    ui.checkbox(&mut settings.show_streams, "3  Wall streams");
-                    ui.checkbox(&mut settings.show_labels, "4  Labels");
-                    ui.checkbox(&mut settings.issues_only, "5  Issues only");
-                    ui.checkbox(&mut settings.reduced_motion, "M  Reduced motion");
-                    ui.separator();
-                    ui.checkbox(&mut st.show_list, "L  Process list");
-                    ui.checkbox(&mut st.show_inspector, "I  Inspector");
-                });
-                let label = format!("{}{} · {:.0} fps", quality.tier.label(), if quality.auto { " (auto)" } else { "" }, 1000.0 / quality.frame_ms.max(0.1));
-                ui.menu_button(label, |ui| {
-                    ui.label(RichText::new(format!("{} · {}", quality.adapter, quality.backend)).color(DIM).small());
-                    if quality.software {
-                        ui.label(RichText::new("Software renderer detected: limited to LOW").color(AMBER).small());
+                let procs = m.snapshot.processes.values().filter(|p| p.realm == Realm::User).count();
+                let kern = m.snapshot.processes.len() - procs;
+                stat(ui, "PROCS", format!("{procs} · {kern} kern")).on_hover_text(format!("{procs} user-space processes, {kern} kernel-side"));
+                if let Some(l) = s.load_avg {
+                    stat(ui, "LOAD", format!("{:.1}", l[0])).on_hover_text(format!("load average 1/5/15 min: {:.2} {:.2} {:.2}", l[0], l[1], l[2]));
+                }
+                ui.label(label("UP"));
+                ui.label(RichText::new(fmt_uptime(s.uptime_secs)).size(13.0).color(SIGNAL_DIM));
+                ui.add_space(12.0);
+                ui.label(label("WALL"));
+                dot_meter(ui, s.kernel_pressure, 20, pressure_color(s.kernel_pressure));
+                let pc = if s.kernel_pressure >= 0.9 { ISSUE } else { SIGNAL };
+                ui.label(RichText::new(format!("{:.0}%", s.kernel_pressure * 100.0)).font(semibold(13.0)).color(pc));
+                let src = if m.snapshot.caps.pressure_stall { "PSI" } else { "est." };
+                ui.label(label(src)).on_hover_text(
+                    "Kernel pressure drives the Wall's rain.\nPSI = Linux pressure-stall information; est. = estimated from CPU and memory on this platform.",
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(RichText::new("?").color(SIGNAL)).on_hover_text("Shortcuts (?)").clicked() {
+                        st.show_help = !st.show_help;
                     }
-                    if ui.radio(quality.auto, "Automatic").clicked() {
-                        quality.set_manual(None);
-                    }
-                    for t in Tier::ALL {
-                        if ui.radio(!quality.auto && quality.tier == t, t.label()).clicked() {
-                            quality.set_manual(Some(t));
+                    ui.menu_button(RichText::new("VIEW").size(11.0).color(SIGNAL_DIM), |ui| {
+                        ui.checkbox(&mut settings.show_links, "1  All family lines");
+                        ui.checkbox(&mut settings.show_kernel, "2  Kernel side");
+                        ui.checkbox(&mut settings.show_streams, "3  Streams");
+                        ui.checkbox(&mut settings.show_labels, "4  Labels");
+                        ui.checkbox(&mut settings.issues_only, "5  Issues only");
+                        ui.checkbox(&mut settings.reduced_motion, "M  Reduced motion");
+                        ui.add_space(4.0);
+                        ui.checkbox(&mut st.show_list, "L  Process list");
+                        ui.checkbox(&mut st.show_inspector, "I  Inspector");
+                    });
+                    let q = format!("{}{} · {:.0} FPS", quality.tier.label(), if quality.auto { " AUTO" } else { "" }, 1000.0 / quality.frame_ms.max(0.1));
+                    ui.menu_button(RichText::new(q).size(11.0).color(SIGNAL_DIM), |ui| {
+                        ui.label(label(&format!("{} · {}", quality.adapter, quality.backend)));
+                        if quality.software {
+                            ui.label(RichText::new("Software renderer: limited to LOW").size(10.0).color(SIGNAL));
                         }
-                    }
+                        if ui.radio(quality.auto, "Automatic").clicked() {
+                            quality.set_manual(None);
+                        }
+                        for t in Tier::ALL {
+                            if ui.radio(!quality.auto && quality.tier == t, t.label()).clicked() {
+                                quality.set_manual(Some(t));
+                            }
+                        }
+                    });
                 });
             });
-        });
-    });
+        })
+        .response
+        .rect
+        .height()
 }
 
-fn bottom_bar(root: &mut Ui, m: &Machine, settings: &SceneSettings) {
-    egui::Panel::bottom("bottom").frame(bar_frame()).show(root, |ui| {
-        ui.horizontal(|ui| {
-            let hist = &m.sys_history;
-            let series = |i: usize| hist.iter().map(|h| h[i]).collect::<Vec<_>>();
-            spark_labeled(ui, "CPU", &series(0), 100.0, CYAN);
-            spark_labeled(ui, "MEM", &series(1), 100.0, INDIGO);
-            spark_labeled(ui, "WALL", &series(2).iter().map(|v| v * 100.0).collect::<Vec<_>>(), 100.0, RED);
-            ui.separator();
-            legend(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hints = "↑↓←→ walk tree · Tab busiest · / search · drag orbit · WASD pan · F follow · Home overview · H hide HUD · ? help";
-                ui.label(RichText::new(hints).color(DIM).small());
-                if settings.issues_only {
-                    ui.label(RichText::new("ISSUES ONLY").color(AMBER).strong().small());
-                }
+fn bottom_bar(root: &mut Ui, m: &Machine, settings: &SceneSettings, floor: &FloorInfo) -> f32 {
+    egui::Panel::bottom("bottom")
+        .frame(bare_frame(14, 10))
+        .show_separator_line(false)
+        .show(root, |ui| {
+            ui.horizontal(|ui| {
+                let hist = &m.sys_history;
+                let series = |i: usize, k: f32| hist.iter().map(|h| h[i] * k).collect::<Vec<_>>();
+                spark_labeled(ui, "CPU", &series(0, 1.0), 100.0, OK);
+                spark_labeled(ui, "MEM", &series(1, 1.0), 100.0, KERNEL);
+                spark_labeled(ui, "WALL", &series(2, 100.0), 100.0, WALL_HOT);
+                ui.add_space(12.0);
+                legend(ui, floor);
             });
-        });
-    });
+            ui.horizontal(|ui| {
+                if settings.issues_only {
+                    ui.label(RichText::new("ISSUES ONLY").font(semibold(10.0)).color(SIGNAL));
+                }
+                let hints = "↑↓←→ walk tree · Tab busiest · / search · drag orbit · WASD pan · F follow · Home overview · H hide · ? help";
+                ui.label(RichText::new(hints).size(10.0).color(SIGNAL_DIM));
+            });
+        })
+        .response
+        .rect
+        .height()
 }
 
-fn legend(ui: &mut Ui) {
-    let item = |ui: &mut Ui, c: Color32, text: &str| {
-        ui.label(RichText::new("■").color(c).strong());
-        ui.label(RichText::new(text).color(DIM).small());
+fn legend(ui: &mut Ui, floor: &FloorInfo) {
+    for (g, c, text) in [
+        (Glyph::Square, OK, "healthy"),
+        (Glyph::Diamond, WATCH, "watch"),
+        (Glyph::Cross, ISSUE, "issue"),
+        (Glyph::Triangle, KERNEL, "kernel"),
+    ] {
+        glyph(ui, g, c);
+        ui.label(RichText::new(text).size(10.0).color(SIGNAL_DIM));
+    }
+    let floor_text = if floor.mb_per_dot > 0 {
+        format!(" · floor: 1 dot = {} MB RAM", floor.mb_per_dot)
+    } else {
+        String::new()
     };
-    item(ui, BLUE, "healthy");
-    item(ui, VIOLET, "watch");
-    item(ui, RED, "issue");
-    item(ui, INDIGO, "kernel");
     ui.label(
-        RichText::new("height & density = memory · brightness & rising pulses = CPU")
-            .color(DIM)
-            .small(),
+        RichText::new(format!("height = memory · light = CPU{floor_text}"))
+            .size(10.0)
+            .color(SIGNAL_DIM),
     );
 }
 
-/// List glyph: color is health only, matching the scene. Kernel threads get
-/// a different glyph so they stay distinguishable without color.
-pub fn glyph(p: &Process) -> (&'static str, Color32) {
-    let g = if p.realm == Realm::Kernel {
-        "▲"
-    } else {
-        "■"
-    };
-    let c = match (p.health(), p.realm) {
-        (Health::Critical, _) => RED,
-        (Health::Warning, _) => VIOLET,
-        (Health::Healthy, Realm::Kernel) => INDIGO,
-        (Health::Healthy, Realm::User) => BLUE,
-    };
-    (g, c)
+/// A process's CPU in the list and inspector: health color when not healthy.
+fn cpu_color(p: &Process) -> Color32 {
+    match p.health() {
+        Health::Critical => ISSUE,
+        Health::Warning => WATCH,
+        Health::Healthy => SIGNAL,
+    }
 }
 
 fn process_list(
@@ -356,18 +457,32 @@ fn process_list(
     sel: &mut Selection,
     st: &mut UiState,
     sel_changed: bool,
-) {
+) -> f32 {
     egui::Panel::left("procs")
-        .frame(side_frame())
-        .default_size(300.0)
+        .frame(bare_frame(14, 8))
+        .show_separator_line(false)
+        .default_size(330.0)
         .resizable(true)
         .show(root, |ui| {
-            ui.label(RichText::new("PROCESSES").color(CYAN).strong());
+            ui.label(label("PROCESSES"));
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut st.search)
-                    .hint_text("search name, pid, user  ( / )")
-                    .desired_width(f32::INFINITY),
+                    .hint_text(RichText::new("search name, pid, user  ( / )").color(SIGNAL_DIM))
+                    .desired_width(f32::INFINITY)
+                    .frame(egui::Frame::NONE),
             );
+            // The search field is a line of dots, not a box.
+            let r = edit.rect;
+            let line_c = if edit.has_focus() { SIGNAL } else { DOT_OFF };
+            let mut x = r.left();
+            while x < r.right() {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(Pos2::new(x, r.bottom() + 1.0), vec2(2.0, 1.0)),
+                    0.0,
+                    line_c,
+                );
+                x += 4.0;
+            }
             if st.focus_search {
                 edit.request_focus();
                 st.focus_search = false;
@@ -401,11 +516,11 @@ fn process_list(
                 sel.follow = true;
             }
             ui.label(
-                RichText::new(format!("{} shown · sorted by CPU", rows.len()))
-                    .color(DIM)
-                    .small(),
+                RichText::new(format!("{} shown · by CPU", rows.len()))
+                    .size(10.0)
+                    .color(SIGNAL_DIM),
             );
-            ui.separator();
+            ui.add_space(4.0);
             egui::ScrollArea::vertical().auto_shrink(false).show_rows(
                 ui,
                 18.0,
@@ -413,15 +528,16 @@ fn process_list(
                 |ui, range| {
                     for p in &rows[range] {
                         let selected = sel.key == Some(p.key);
-                        let (g, c) = glyph(p);
                         let resp = ui
                             .horizontal(|ui| {
                                 ui.set_min_height(18.0);
-                                ui.label(RichText::new(g).color(c));
-                                let name = RichText::new(truncate(&p.name, 19))
-                                    .color(if selected { Color32::WHITE } else { TEXT });
+                                let (g, c) = glyph_of(p);
+                                glyph(ui, g, c);
+                                let name = RichText::new(truncate(&p.name, 17))
+                                    .size(11.0)
+                                    .color(if selected { SELECT } else { SIGNAL });
                                 let r = ui.add(
-                                    egui::Button::selectable(selected, name)
+                                    egui::Button::selectable(false, name)
                                         .frame_when_inactive(false),
                                 );
                                 ui.with_layout(
@@ -429,19 +545,27 @@ fn process_list(
                                     |ui| {
                                         ui.label(
                                             RichText::new(fmt_bytes(p.mem_bytes))
-                                                .color(DIM)
-                                                .small(),
+                                                .size(10.0)
+                                                .color(SIGNAL_DIM),
                                         );
                                         ui.label(
                                             RichText::new(format!("{:>5.1}%", p.cpu_pct))
-                                                .color(heat(p.cpu_pct / 100.0))
-                                                .small(),
+                                                .size(10.0)
+                                                .color(cpu_color(p)),
                                         );
                                     },
                                 );
                                 r
                             })
                             .inner;
+                        if selected {
+                            ui.painter().rect_stroke(
+                                resp.rect.expand(1.0),
+                                0.0,
+                                Stroke::new(1.0, SELECT),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
                         if resp.clicked() {
                             sel.key = Some(p.key);
                             sel.follow = true;
@@ -452,112 +576,138 @@ fn process_list(
                     }
                 },
             );
-        });
+        })
+        .response
+        .rect
+        .width()
 }
 
-fn inspector(root: &mut Ui, m: &Machine, sel: &mut Selection, sl: &SceneLayout) {
-    egui::Panel::right("inspector").frame(side_frame()).default_size(330.0).resizable(true).show(root, |ui| {
-        let Some(p) = sel.key.and_then(|k| m.snapshot.processes.get(&k)) else {
-            ui.label(RichText::new("INSPECTOR").color(CYAN).strong());
+fn inspector(root: &mut Ui, m: &Machine, sel: &mut Selection, sl: &SceneLayout) -> f32 {
+    egui::Panel::right("inspector")
+        .frame(bare_frame(14, 8))
+        .show_separator_line(false)
+        .default_size(330.0)
+        .resizable(true)
+        .show(root, |ui| {
+            let Some(p) = sel.key.and_then(|k| m.snapshot.processes.get(&k)) else {
+                ui.label(label("INSPECTOR"));
+                ui.add_space(8.0);
+                ui.label(RichText::new("Nothing selected.").size(12.0).color(SIGNAL));
+                ui.label(RichText::new("Click a column, pick one from the list, or press ↓ or Tab to start walking the tree.").size(11.0).color(SIGNAL_DIM));
+                return;
+            };
+            ui.horizontal(|ui| {
+                let (g, c) = glyph_of(p);
+                glyph(ui, g, c);
+                let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), egui::Sense::hover());
+                glow_text(ui.painter(), r.left_center(), egui::Align2::LEFT_CENTER, &truncate(&p.name, 24), semibold(17.0), SELECT, OK);
+            });
+            let realm = match p.realm {
+                Realm::Kernel => format!("kernel side · {}", sl.layout.subsystem_of(&p.key).map(|s| s.label()).unwrap_or("kernel")),
+                Realm::User => "deep space (user)".into(),
+            };
+            ui.label(RichText::new(realm).size(10.0).color(SIGNAL_DIM));
             ui.add_space(8.0);
-            ui.label(RichText::new("Nothing selected.").color(TEXT));
-            ui.label(RichText::new("Click an entity, pick one from the list, or press ↓ / Tab to start walking the tree.").color(DIM));
-            return;
-        };
-        let (g, c) = glyph(p);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(g).color(c).size(20.0));
-            ui.label(RichText::new(&p.name).size(18.0).strong().color(Color32::WHITE));
-        });
-        let realm = match p.realm {
-            Realm::Kernel => format!("kernel side · {}", sl.layout.subsystem_of(&p.key).map(|s| s.label()).unwrap_or("kernel")),
-            Realm::User => "deep space (user)".into(),
-        };
-        ui.label(RichText::new(realm).color(DIM).small());
-        ui.separator();
-        egui::Grid::new("facts").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
-            let row = |ui: &mut Ui, k: &str, v: String, c: Color32| {
-                ui.label(RichText::new(k).color(DIM));
-                ui.label(RichText::new(v).color(c));
-                ui.end_row();
-            };
-            row(ui, "PID", p.key.pid.to_string(), TEXT);
-            row(ui, "USER", p.user.clone().unwrap_or_else(|| "?".into()), TEXT);
-            let (state, sc) = match p.state {
-                ProcState::Running => ("running", GREEN),
-                ProcState::Sleeping => ("sleeping", TEXT),
-                ProcState::DiskWait => ("uninterruptible IO wait", RED),
-                ProcState::Stopped => ("stopped", RED),
-                ProcState::Zombie => ("zombie (exited, not reaped)", RED),
-                ProcState::Idle => ("idle", DIM),
-                ProcState::Unknown => ("unknown", DIM),
-            };
-            row(ui, "STATE", state.into(), sc);
-            row(ui, "CPU", format!("{:.1}%", p.cpu_pct), heat(p.cpu_pct / 100.0));
-            row(ui, "MEMORY", format!("{} rss · {} virt", fmt_bytes(p.mem_bytes), fmt_bytes(p.virt_bytes)), TEXT);
-            if let Some(t) = p.threads {
-                row(ui, "THREADS", t.to_string(), TEXT);
-            }
-            if m.snapshot.caps.process_io {
-                row(ui, "DISK IO", format!("↓ {}/s  ↑ {}/s", fmt_bytes(p.io_read_bytes), fmt_bytes(p.io_write_bytes)), TEXT);
-            }
-        });
-        if let Some(reason) = p.health_reason() {
-            let c = if p.health() == Health::Critical { RED } else { VIOLET };
-            ui.label(RichText::new(format!("⚠ {reason}")).color(c).strong());
-        }
-        if p.restricted {
-            ui.label(RichText::new("🔒 Details restricted by the OS. Elevated read access arrives with the ICE helper.").color(AMBER).small());
-        }
-        ui.add_space(6.0);
-        if let Some(h) = m.cpu_history.get(&p.key) {
-            let v: Vec<f32> = h.iter().copied().collect();
-            let max = v.iter().copied().fold(10.0, f32::max);
-            spark_labeled(ui, "CPU", &v, max, CYAN);
-        }
-        if let Some(h) = m.mem_history.get(&p.key) {
-            let v: Vec<f32> = h.iter().copied().collect();
-            let max = v.iter().copied().fold(1.0, f32::max) * 1.2;
-            spark_labeled(ui, "MEM", &v, max, INDIGO);
-        }
-        ui.separator();
-        if let Some(exe) = &p.exe {
-            ui.label(RichText::new("EXECUTABLE").color(DIM).small());
-            ui.label(RichText::new(exe).color(TEXT).monospace().small());
-        }
-        if !p.cmd.is_empty() {
-            ui.label(RichText::new("COMMAND").color(DIM).small());
-            ui.label(RichText::new(truncate(&p.cmd.join(" "), 300)).color(TEXT).monospace().small());
-        }
-        ui.separator();
-        if let Some(parent) = p.parent.and_then(|k| m.snapshot.processes.get(&k)) {
-            ui.label(RichText::new("PARENT  ↑").color(DIM).small());
-            let (g, c) = glyph(parent);
-            if ui.button(RichText::new(format!("{g} {}  ({})", parent.name, parent.key.pid)).color(c)).clicked() {
-                sel.last_child.insert(parent.key, p.key);
-                sel.key = Some(parent.key);
-                sel.follow = true;
-            }
-        }
-        let mut kids: Vec<&Process> = m.snapshot.processes.values().filter(|c| c.parent == Some(p.key)).collect();
-        if !kids.is_empty() {
-            kids.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
-            ui.label(RichText::new(format!("CHILDREN  ↓  ({})", kids.len())).color(DIM).small());
-            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                for k in kids {
-                    let (g, c) = glyph(k);
-                    if ui.button(RichText::new(format!("{g} {}  {:.1}%", truncate(&k.name, 28), k.cpu_pct)).color(c)).clicked() {
-                        sel.key = Some(k.key);
-                        sel.follow = true;
-                    }
+            egui::Grid::new("facts").num_columns(2).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
+                let row = |ui: &mut Ui, k: &str, v: String, c: Color32| {
+                    ui.label(label(k));
+                    ui.label(RichText::new(v).size(12.0).color(c));
+                    ui.end_row();
+                };
+                row(ui, "PID", p.key.pid.to_string(), SIGNAL);
+                row(ui, "USER", p.user.clone().unwrap_or_else(|| "?".into()), SIGNAL);
+                let (state, sc) = match p.state {
+                    ProcState::Running => ("running", SIGNAL),
+                    ProcState::Sleeping => ("sleeping", SIGNAL),
+                    ProcState::DiskWait => ("uninterruptible IO wait", ISSUE),
+                    ProcState::Stopped => ("stopped", ISSUE),
+                    ProcState::Zombie => ("zombie (exited, not reaped)", ISSUE),
+                    ProcState::Idle => ("idle", SIGNAL_DIM),
+                    ProcState::Unknown => ("unknown", SIGNAL_DIM),
+                };
+                row(ui, "STATE", state.into(), sc);
+                row(ui, "CPU", format!("{:.1}%", p.cpu_pct), cpu_color(p));
+                row(ui, "MEMORY", format!("{} rss · {} virt", fmt_bytes(p.mem_bytes), fmt_bytes(p.virt_bytes)), SIGNAL);
+                if let Some(t) = p.threads {
+                    row(ui, "THREADS", t.to_string(), SIGNAL);
+                }
+                if m.snapshot.caps.process_io {
+                    row(ui, "DISK IO", format!("↓ {}/s  ↑ {}/s", fmt_bytes(p.io_read_bytes), fmt_bytes(p.io_write_bytes)), SIGNAL);
                 }
             });
-        }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let follow = if sel.follow { "camera following · F to release" } else { "camera free · F to follow" };
-            ui.label(RichText::new(follow).color(DIM).small());
-        });
-    });
+            if let Some(reason) = p.health_reason() {
+                let (g, c) = glyph_of(p);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    glyph(ui, g, c);
+                    ui.label(RichText::new(reason).font(semibold(12.0)).color(c));
+                });
+            }
+            if p.restricted {
+                ui.label(RichText::new("Details restricted by the OS. Elevated read access arrives with the ICE helper.").size(10.0).color(SIGNAL_DIM));
+            }
+            ui.add_space(8.0);
+            if let Some(h) = m.cpu_history.get(&p.key) {
+                let v: Vec<f32> = h.iter().copied().collect();
+                let max = v.iter().copied().fold(10.0, f32::max);
+                let c = if p.health() == Health::Healthy { OK } else { cpu_color(p) };
+                spark_labeled(ui, "CPU", &v, max, c);
+            }
+            if let Some(h) = m.mem_history.get(&p.key) {
+                let v: Vec<f32> = h.iter().copied().collect();
+                let max = v.iter().copied().fold(1.0, f32::max) * 1.2;
+                spark_labeled(ui, "MEM", &v, max, KERNEL);
+            }
+            ui.add_space(8.0);
+            if let Some(exe) = &p.exe {
+                ui.label(label("EXECUTABLE"));
+                ui.label(RichText::new(exe).size(10.0).color(SIGNAL));
+            }
+            if !p.cmd.is_empty() {
+                ui.label(label("COMMAND"));
+                ui.label(RichText::new(truncate(&p.cmd.join(" "), 300)).size(10.0).color(SIGNAL));
+            }
+            ui.add_space(8.0);
+            if let Some(parent) = p.parent.and_then(|k| m.snapshot.processes.get(&k)) {
+                ui.label(label("PARENT ↑"));
+                if family_button(ui, parent, &format!("{}  ({})", parent.name, parent.key.pid)) {
+                    sel.last_child.insert(parent.key, p.key);
+                    sel.key = Some(parent.key);
+                    sel.follow = true;
+                }
+            }
+            let mut kids: Vec<&Process> = m.snapshot.processes.values().filter(|c| c.parent == Some(p.key)).collect();
+            if !kids.is_empty() {
+                kids.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
+                ui.label(label(&format!("CHILDREN ↓  ({})", kids.len())));
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for k in kids {
+                        if family_button(ui, k, &format!("{}  {:.1}%", truncate(&k.name, 28), k.cpu_pct)) {
+                            sel.key = Some(k.key);
+                            sel.follow = true;
+                        }
+                    }
+                });
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                let follow = if sel.follow { "camera following · F to release" } else { "camera free · F to follow" };
+                ui.label(RichText::new(follow).size(10.0).color(SIGNAL_DIM));
+            });
+        })
+        .response
+        .rect
+        .width()
+}
+
+/// A parent or child: its glyph, then its name as a text button.
+fn family_button(ui: &mut Ui, p: &Process, text: &str) -> bool {
+    ui.horizontal(|ui| {
+        let (g, c) = glyph_of(p);
+        glyph(ui, g, c);
+        ui.add(egui::Button::new(RichText::new(text).size(12.0).color(SIGNAL)).frame(false))
+            .clicked()
+    })
+    .inner
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -575,7 +725,7 @@ fn world_labels(
         .painter()
         .with_clip_rect(root.available_rect_before_wrap());
     let painter = &painter;
-    let font = egui::FontId::monospace(12.0);
+    let font = egui::FontId::monospace(11.0);
     let mut placed: Vec<egui::Rect> = Vec::new();
     let project = |p: Vec3| {
         camera
@@ -588,8 +738,8 @@ fn world_labels(
             continue;
         }
         let (offset, color) = match label.kind {
-            LabelKind::Subsystem => (Vec3::new(0.0, 0.6, 0.0), INDIGO),
-            LabelKind::Volume => (Vec3::new(0.0, 0.5, 0.0), TEXT),
+            LabelKind::Subsystem => (Vec3::new(0.0, 0.6, 0.0), KERNEL),
+            LabelKind::Volume => (Vec3::new(0.0, 0.5, 0.0), SIGNAL_DIM),
         };
         if let Some(p) = project(tf.translation() + offset) {
             let galley = painter.layout_no_wrap(label.text.clone(), font.clone(), color);
@@ -603,7 +753,8 @@ fn world_labels(
             painter.galley(rect.min + vec2(2.0, 2.0), galley, color);
         }
     }
-    // Name the busiest processes, plus the selected and hovered ones.
+    // Name the busiest processes, plus the selected and hovered ones. Bare
+    // text on black; selected and hovered get an outline and win overlaps.
     let mut top: Vec<&Process> = m
         .snapshot
         .processes
@@ -612,7 +763,6 @@ fn world_labels(
         .collect();
     top.sort_by(|a, b| b.cpu_pct.total_cmp(&a.cpu_pct));
     let keys: Vec<_> = top.iter().take(8).map(|p| p.key).collect();
-    // Selected and hovered first, so they win any overlap.
     let mut ordered: Vec<_> = sel.key.into_iter().chain(sel.hovered).collect();
     ordered.extend(keys);
     for k in ordered {
@@ -628,9 +778,9 @@ fn world_labels(
         let strong = Some(k) == sel.key || Some(k) == sel.hovered;
         let text = format!("{}  {:.0}%", truncate(&p.name, 22), p.cpu_pct);
         let galley = painter.layout_no_wrap(
-            text,
+            text.clone(),
             font.clone(),
-            if strong { Color32::WHITE } else { TEXT },
+            if strong { SELECT } else { SIGNAL },
         );
         let rect = egui::Align2::CENTER_BOTTOM
             .anchor_size(pos, galley.size())
@@ -639,21 +789,31 @@ fn world_labels(
             continue;
         }
         placed.push(rect);
-        painter.rect_filled(
-            rect,
-            2.0,
-            Color32::from_rgba_unmultiplied(4, 3, 12, if strong { 220 } else { 150 }),
-        );
         if strong {
-            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, CYAN), egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, SELECT),
+                egui::StrokeKind::Outside,
+            );
+            glow_text(
+                painter,
+                rect.min + vec2(3.0, 3.0),
+                egui::Align2::LEFT_TOP,
+                &text,
+                font.clone(),
+                SELECT,
+                OK,
+            );
+        } else {
+            painter.galley(rect.min + vec2(3.0, 3.0), galley, SIGNAL);
         }
-        painter.galley(rect.min + vec2(3.0, 3.0), galley, TEXT);
     }
 }
 
 fn help_window(ctx: &egui::Context, st: &mut UiState) {
     let mut open = true;
-    egui::Window::new("SHORTCUTS")
+    egui::Window::new(RichText::new("SHORTCUTS").size(11.0).color(SIGNAL_DIM))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -680,12 +840,13 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                         ("Home", "overview"),
                         (
                             "1 2 3 4 5",
-                            "links · kernel · streams · labels · issues-only",
+                            "family lines · kernel · streams · labels · issues only",
                         ),
                         ("M", "reduced motion"),
+                        ("Any key during start-up", "skip the jack-in"),
                     ] {
-                        ui.label(RichText::new(k).color(CYAN).monospace());
-                        ui.label(RichText::new(v).color(TEXT));
+                        ui.label(RichText::new(k).size(11.0).color(SIGNAL));
+                        ui.label(RichText::new(v).size(11.0).color(SIGNAL_DIM));
                         ui.end_row();
                     }
                 });
@@ -703,57 +864,17 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-fn stat(ui: &mut Ui, k: &str, v: &str, c: Color32) -> egui::Response {
-    ui.label(RichText::new(k).color(DIM).small());
-    ui.label(RichText::new(v).color(c).strong())
-}
-
-fn meter(ui: &mut Ui, frac: f32, width: f32, c: Color32) {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 10.0), egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(
-        rect,
-        1.0,
-        Color32::from_rgba_unmultiplied(255, 255, 255, 18),
-    );
-    let mut fill = rect;
-    fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
-    p.rect_filled(fill, 1.0, c);
-}
-
-fn spark_labeled(ui: &mut Ui, label: &str, v: &[f32], max: f32, c: Color32) {
+fn spark_labeled(ui: &mut Ui, name: &str, v: &[f32], max: f32, c: Color32) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(DIM).small());
-        sparkline(ui, v, max, c, vec2(110.0, 22.0));
+        ui.label(label(name));
+        dot_sparkline(ui, v, max, c, vec2(110.0, 22.0), bw_scene::HISTORY_LEN);
         if let Some(last) = v.last() {
             let txt = if max > 100.0 {
                 fmt_bytes(*last as u64)
             } else {
                 format!("{last:.0}%")
             };
-            ui.label(RichText::new(txt).color(c).small());
+            ui.label(RichText::new(txt).size(10.0).color(c));
         }
     });
-}
-
-fn sparkline(ui: &mut Ui, v: &[f32], max: f32, c: Color32, size: egui::Vec2) {
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 8));
-    if v.len() < 2 {
-        return;
-    }
-    let n = bw_scene::HISTORY_LEN.max(v.len()) as f32;
-    let start = n - v.len() as f32;
-    let pts: Vec<Pos2> = v
-        .iter()
-        .enumerate()
-        .map(|(i, y)| {
-            Pos2::new(
-                rect.left() + (start + i as f32) / (n - 1.0) * rect.width(),
-                rect.bottom() - (y / max.max(1e-6)).clamp(0.0, 1.0) * rect.height(),
-            )
-        })
-        .collect();
-    p.add(egui::Shape::line(pts, Stroke::new(1.4, c)));
 }

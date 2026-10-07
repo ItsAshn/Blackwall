@@ -124,10 +124,12 @@ fn update_wall(
     settings: Res<SceneSettings>,
     quality: Res<Quality>,
     time: Res<Time>,
+    jack: Res<crate::camera::JackIn>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut wall_mats: ResMut<Assets<WallMaterial>>,
     mut q: Query<(&mut Transform, &Mesh3d, &MeshMaterial3d<WallMaterial>), With<WallSurface>>,
     mut pressure: Local<f32>,
+    mut clock: Local<f32>,
     mut last_size: Local<(f32, f32)>,
 ) {
     let Ok((mut tf, mesh, mat)) = q.single_mut() else {
@@ -143,14 +145,15 @@ fn update_wall(
     tf.translation = Vec3::new(0.0, size.1 / 2.0, sl.layout.wall_z());
     let dt = time.delta_secs();
     *pressure += (m.snapshot.system.kernel_pressure - *pressure) * (1.0 - (-dt * 1.5).exp());
+    // The rain runs on its own clock so the jack-in can speed it up smoothly;
+    // under reduced motion it stands still.
+    if !settings.reduced_motion {
+        *clock += dt * jack.rain_boost();
+    }
     if let Some(mut w) = wall_mats.get_mut(&mat.0) {
         let glitch = if settings.reduced_motion { 0.0 } else { 1.0 };
-        let t = if settings.reduced_motion {
-            0.0
-        } else {
-            time.elapsed_secs()
-        };
-        w.params.state = Vec4::new(*pressure, t, glitch, quality.tier.wall_intensity());
+        w.params.state = Vec4::new(*pressure, *clock, glitch, quality.tier.wall_intensity());
+        w.params.extra = Vec4::new(1.0, size.1, 0.0, 0.0);
     }
 }
 

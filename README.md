@@ -1,28 +1,33 @@
 # Blackwall
 
-A cyberpunk system visualizer modelled on the Blackwall chamber in Cyberpunk 2077. Every process is a **column of dots** in a city on a dot-lattice floor. The **Blackwall**, the kernel/user boundary, rises behind the city as a curtain of light streaks, and the kernel's threads stand on its far side. Use it as ambient art, or drill into any column for real diagnostics.
+A cyberpunk system visualizer modelled on the Blackwall chamber in Cyberpunk 2077, entered the way you'd fall into the Matrix. Every process is a **column of light** in a city standing on a floor that is the machine's RAM. Behind it hangs the **Blackwall**, the kernel/user boundary, as a curtain of falling magenta rain, with the kernel's threads on its far side. Use it as ambient art, or drill into any column for real diagnostics.
 
-Native Rust (Bevy + egui) for **Linux, Windows and macOS**. No paid code-signing certificates required (see [docs/PLAN.md](docs/PLAN.md) §3.7).
+Native Rust (Bevy + egui) for **Linux, Windows and macOS**. No paid code-signing certificates required (see [docs/PLAN.md](docs/PLAN.md) §3.7). The visual language is defined in the Blackwall design system (Claude Design); `crates/bw-scene/src/palette.rs` mirrors its colors.
 
 > Status: early development, Milestones 0–1 (foundation + Deep Space). See the full [plan](docs/PLAN.md).
 
-![Overview: the process city in front of the Blackwall](docs/images/overview.png)
+![Overview: the process city in front of the Blackwall's rain](docs/images/overview.png)
 
 ## What you're looking at
 
-Only dots, lines and streams of dots. **Color means health and nothing else**, so red always means "look here".
+**Black is nothing; light is data.** Every pixel that doesn't stand for something is pure black. **Color means health and nothing else**, so red always means "look here".
 
 | | |
 |---|---|
 | **Column** | One process. Taller and denser (1×1 up to 3×3 dots) = more memory |
-| **Brightness, rising pulses** | CPU usage |
-| **Blue / violet / red** | Healthy / worth watching (saturating a core) / issue (zombie, stuck in IO wait, stopped; blinks) |
-| **Districts** | Each process tree is a block of columns, families side by side; streets between trees |
-| **The Blackwall** | Curtain of streaks: calm violet-blue. Under **kernel pressure** (Linux PSI, estimated elsewhere) it speeds up, crowds together, glitches and burns red |
-| **Behind the Wall** | Kernel threads as indigo columns, in districts per subsystem (scheduler, memory, storage, core, network, drivers, interrupts) |
-| **Streams of dots** | Disk IO flowing along the floor through the Wall to storage; CPU work flowing to the scheduler. Red streams come from processes with issues |
-| **Tall 3×3 columns at the left** | Volumes: lit dots = used space, blue → violet at 75% → red at 90% |
-| **Lines on the floor** | Family of the selected process (parent and children) |
+| **Brightness, rising pulses** | CPU usage; the busiest dots burn to a white core |
+| **Ice blue / violet / red** | Healthy / worth watching (saturating a core) / issue (zombie, stuck in IO wait, stopped; blinks) |
+| **Districts** | Each process tree is a block of columns, families side by side |
+| **Floor** | RAM: one dot per 64 MB (more on big machines), lit from the city outward as memory fills |
+| **The Blackwall** | Falling rain of magenta dots with white-hot heads. Under **kernel pressure** (Linux PSI, estimated elsewhere) it thickens, speeds up, burns red and tears |
+| **Behind the Wall** | Kernel threads as indigo columns, in districts per subsystem |
+| **Streams of dots** | Disk IO flowing through the Wall to storage; CPU work flowing to the scheduler. Red streams come from processes with issues |
+| **Tall 3×3 columns at the left** | Volumes: lit dots = used space |
+| **Exits** | A process that exits dissolves upward into the dark |
+
+Opening Blackwall falls through the rain into the chamber while the city resolves out of black (any key skips it; `--no-intro` turns it off).
+
+![Jacking in: falling through the Blackwall's rain](docs/images/jack-in.png)
 
 ![Inspector: a process stuck in IO wait, tethered through the Wall to storage](docs/images/inspector.png)
 
@@ -33,7 +38,7 @@ cargo run --release -p blackwall             # this machine
 cargo run --release -p blackwall -- --demo   # a synthetic workstation (labelled DEMO DATA)
 ```
 
-Options: `--quality low|medium|high|ultra` (default: automatic), `--interval-ms N`, `--size WxH`, `--select NAME`, `--hide-ui`, `--screenshot out.png --after SECONDS`.
+Options: `--quality low|medium|high|ultra` (default: automatic), `--interval-ms N`, `--size WxH`, `--select NAME`, `--hide-ui`, `--no-intro`, `--screenshot out.png --after SECONDS`.
 
 ### Linux build dependencies
 

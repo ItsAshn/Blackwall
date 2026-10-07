@@ -66,6 +66,66 @@ impl OrbitCam {
     }
 }
 
+/// Length of the jack-in sequence (design system: `jack-in`).
+pub const JACK_IN_SECS: f32 = 3.2;
+
+/// The entry sequence: falling through the Wall's rain into the chamber.
+/// 0–1.2s the camera drops through racing rain close to the Wall; then it
+/// pulls back to the overview while the city resolves out of black.
+#[derive(Resource, Debug, Clone)]
+pub struct JackIn {
+    /// Off with `--no-intro` or reduced motion.
+    pub enabled: bool,
+    /// Seconds since it started; `None` until the first data arrives.
+    pub elapsed: Option<f32>,
+    pub done: bool,
+    start: (Vec3, f32, f32, f32),
+    end: (Vec3, f32, f32, f32),
+}
+
+impl Default for JackIn {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            elapsed: None,
+            done: false,
+            start: (Vec3::ZERO, 0.0, 0.0, 1.0),
+            end: (Vec3::ZERO, 0.0, 0.0, 1.0),
+        }
+    }
+}
+
+impl JackIn {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Self::default()
+        }
+    }
+
+    pub fn running(&self) -> bool {
+        self.elapsed.is_some() && !self.done
+    }
+
+    /// How much faster the rain falls: you are falling through it.
+    pub fn rain_boost(&self) -> f32 {
+        match self.elapsed {
+            Some(t) if !self.done => 1.0 + 7.0 * (1.0 - smooth(0.0, 1.8, t)),
+            _ => 1.0,
+        }
+    }
+
+    /// Delay before the city starts rising, read when the first data arrives.
+    pub fn city_delay(&self) -> f32 {
+        if self.enabled && !self.done { 1.2 } else { 0.0 }
+    }
+}
+
+fn smooth(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Written by the UI each frame: input the UI has claimed.
 #[derive(Resource, Default, Debug)]
 pub struct InputBlock {
@@ -76,6 +136,7 @@ pub struct InputBlock {
 pub(crate) fn plugin(app: &mut App) {
     app.init_resource::<OrbitCam>()
         .init_resource::<InputBlock>()
+        .init_resource::<JackIn>()
         .add_systems(Startup, spawn_camera)
         .add_systems(
             Update,
@@ -272,6 +333,10 @@ fn follow_and_apply(
     ents: Res<ProcEntities>,
     shown: Query<&Shown>,
     mut cam: ResMut<OrbitCam>,
+    mut jack: ResMut<JackIn>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     mut tf: Query<&mut Transform, With<MainCamera>>,
     mut last_sel: Local<Option<ProcKey>>,
 ) {
@@ -279,9 +344,47 @@ fn follow_and_apply(
     if m.received && !cam.framed && sl.layout.extent > 0.0 {
         cam.framed = true;
         cam.frame_all(sl.layout.extent);
-        let (f, d) = (cam.t_focus, cam.t_dist);
-        cam.focus = f;
-        cam.dist = d * 1.6; // fly in on start
+        if jack.enabled && !settings.reduced_motion {
+            // Start inside the rain, a few units in front of the Wall.
+            jack.start = (Vec3::new(0.0, 18.0, sl.layout.wall_z()), 0.0, 0.05, 13.0);
+            jack.end = (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist);
+            jack.elapsed = Some(0.0);
+        } else {
+            jack.done = true;
+            let (f, d) = (cam.t_focus, cam.t_dist);
+            cam.focus = f;
+            cam.dist = d;
+            cam.yaw = cam.t_yaw;
+            cam.pitch = cam.t_pitch;
+        }
+    }
+    if jack.running() {
+        let skip = keys.get_just_pressed().next().is_some()
+            || buttons.get_just_pressed().next().is_some()
+            || touches.iter_just_pressed().next().is_some();
+        let e = jack.elapsed.unwrap_or(0.0) + dt;
+        jack.elapsed = Some(e);
+        let (sf, sy, sp, sd) = jack.start;
+        let (ef, ey, ep, ed) = jack.end;
+        if skip || e >= JACK_IN_SECS {
+            jack.done = true;
+            (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist) = (ef, ey, ep, ed);
+        } else {
+            // Fall: drop through the rain, then pull back as the city forms.
+            let fall = smooth(0.0, 1.4, e);
+            let pull = smooth(1.0, 3.0, e);
+            let falling = sf - Vec3::Y * 7.0 * fall;
+            cam.focus = falling.lerp(ef, pull);
+            cam.yaw = sy + (ey - sy) * pull;
+            cam.pitch = sp + (ep - sp) * pull;
+            cam.dist = sd + (ed - sd) * pull * pull;
+            (cam.t_focus, cam.t_yaw, cam.t_pitch, cam.t_dist) =
+                (cam.focus, cam.yaw, cam.pitch, cam.dist);
+            if let Ok(mut t) = tf.single_mut() {
+                *t = Transform::from_translation(cam.eye()).looking_at(cam.focus, Vec3::Y);
+            }
+            return;
+        }
     }
     cam.idle += dt;
     if let Some(s) = sel

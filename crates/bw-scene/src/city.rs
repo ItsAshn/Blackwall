@@ -1,18 +1,20 @@
-//! The city's dots: one mesh for every process, kernel and volume column,
-//! one for the floor lattice, both drawn by `dots.wgsl` (PLAN §6, v3 look).
+//! The chamber's dots: one mesh for every process, kernel and volume column,
+//! one for the RAM floor, both drawn by `dots.wgsl`.
 //!
 //! The meshes are rebuilt when data arrives (about once a second); all
 //! animation runs in the shader, so tens of thousands of dots stay cheap.
+//! The floor is rebuilt only when the city's footprint or the machine's RAM
+//! changes: how much of it is lit is a shader uniform.
 
-use crate::layout::{CELL, Column, LEVEL_H};
-use crate::quality::{Quality, Tier};
+use crate::camera::JackIn;
+use crate::layout::{Column, LEVEL_H};
+use crate::palette::{self, linear};
 use crate::*;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::Indices;
 use bevy::reflect::TypePath;
-use bevy::render::render_resource::PrimitiveTopology;
-use bevy::render::render_resource::{AsBindGroup, ShaderType};
+use bevy::render::render_resource::{AsBindGroup, PrimitiveTopology, ShaderType};
 use bevy::shader::ShaderRef;
 use bw_model::{Health, Process, Realm};
 
@@ -20,6 +22,7 @@ pub(crate) fn plugin(app: &mut App) {
     embedded_asset!(app, "shaders/dots.wgsl");
     app.add_plugins(MaterialPlugin::<DotsMaterial>::default())
         .init_resource::<Born>()
+        .init_resource::<FloorInfo>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -31,18 +34,20 @@ pub(crate) fn plugin(app: &mut App) {
 
 /// Health colors (linear). Color means health and nothing else.
 pub fn health_color(h: Health, realm: Realm) -> [f32; 3] {
-    match (h, realm) {
-        (Health::Critical, _) => [1.0, 0.04, 0.06],
-        (Health::Warning, _) => [0.7, 0.12, 1.0],
-        (Health::Healthy, Realm::Kernel) => [0.28, 0.18, 1.0],
-        (Health::Healthy, Realm::User) => [0.08, 0.38, 1.0],
-    }
+    linear(match (h, realm) {
+        (Health::Critical, _) => palette::HEALTH_ISSUE,
+        (Health::Warning, _) => palette::HEALTH_WATCH,
+        (Health::Healthy, Realm::Kernel) => palette::KERNEL,
+        (Health::Healthy, Realm::User) => palette::HEALTH_OK,
+    })
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
 pub struct DotParams {
     pub a: Vec4,
     pub b: Vec4,
+    pub c: Vec4,
+    pub d: Vec4,
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone, Debug, Default)]
@@ -55,6 +60,14 @@ impl Material for DotsMaterial {
     fn fragment_shader() -> ShaderRef {
         "embedded://bw_scene/shaders/dots.wgsl".into()
     }
+}
+
+/// What one floor dot stands for, for the HUD legend.
+#[derive(Resource, Debug, Default, Clone, Copy)]
+pub struct FloorInfo {
+    /// Megabytes of RAM per floor dot (64, doubled until the dot count fits).
+    pub mb_per_dot: u64,
+    pub dots: usize,
 }
 
 /// When each process was first seen (seconds), for the grow-in effect.
@@ -73,6 +86,12 @@ const KIND_KERNEL: f32 = 1.0;
 const KIND_VOLUME: f32 = 2.0;
 const KIND_FLOOR: f32 = 3.0;
 const KIND_CRITICAL: f32 = 4.0;
+const KIND_DYING: f32 = 5.0;
+
+/// How long an exited process takes to dissolve.
+const DISSOLVE_SECS: f32 = 1.2;
+/// Upper bound on floor dots; above it each dot stands for more RAM.
+const MAX_FLOOR_DOTS: u64 = 12_000;
 
 /// Volume columns get ids above any process column.
 pub const VOLUME_ID_BASE: usize = 1_000_000;
@@ -122,7 +141,7 @@ impl DotMesh {
                 Vec3::new(0.0, -1000.0, 0.0),
                 0.01,
                 [0.0, 0.0],
-                [-9.0, 3.0],
+                [-9.0, KIND_FLOOR],
                 [0.0; 4],
             );
         }
@@ -157,15 +176,23 @@ fn setup(
     commands.insert_resource(CityHandles { city, floor, mat });
 }
 
-fn column_dots(m: &mut DotMesh, id: usize, c: &Column, p: &Process, born: f32) {
-    let health = p.health();
-    let kind = match (health, c.realm) {
-        (Health::Critical, _) => KIND_CRITICAL,
-        (_, Realm::Kernel) => KIND_KERNEL,
-        _ => KIND_PROCESS,
-    };
-    let rgb = health_color(health, c.realm);
-    let cpu = (p.cpu_pct / 100.0).clamp(0.0, 1.0).sqrt();
+/// What a column looked like, kept so it can dissolve after its process exits.
+#[derive(Clone)]
+struct Ghost {
+    column: Column,
+    rgb: [f32; 3],
+    died: f32,
+}
+
+fn column_dots(
+    m: &mut DotMesh,
+    id: usize,
+    c: &Column,
+    rgb: [f32; 3],
+    kind: f32,
+    cpu: f32,
+    time: f32,
+) {
     let fp = c.footprint as i32;
     let spacing = 0.2;
     let half = if c.realm == Realm::Kernel {
@@ -187,11 +214,25 @@ fn column_dots(m: &mut DotMesh, id: usize, c: &Column, p: &Process, born: f32) {
                     half,
                     [cpu, hfrac],
                     [id as f32, kind],
-                    [rgb[0], rgb[1], rgb[2], born],
+                    [rgb[0], rgb[1], rgb[2], time],
                 );
             }
         }
     }
+}
+
+fn process_look(p: &Process, realm: Realm) -> ([f32; 3], f32, f32) {
+    let health = p.health();
+    let kind = match (health, realm) {
+        (Health::Critical, _) => KIND_CRITICAL,
+        (_, Realm::Kernel) => KIND_KERNEL,
+        _ => KIND_PROCESS,
+    };
+    (
+        health_color(health, realm),
+        kind,
+        (p.cpu_pct / 100.0).clamp(0.0, 1.0).sqrt(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,10 +240,13 @@ fn rebuild_city(
     m: Res<Machine>,
     sl: Res<SceneLayout>,
     time: Res<Time>,
+    jack: Res<JackIn>,
     handles: Res<CityHandles>,
     mut born: ResMut<Born>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_gen: Local<u64>,
+    mut last_seen: Local<HashMap<ProcKey, Ghost>>,
+    mut ghosts: Local<Vec<Ghost>>,
 ) {
     if m.generation == *last_gen {
         return;
@@ -210,21 +254,52 @@ fn rebuild_city(
     *last_gen = m.generation;
     let now = time.elapsed_secs();
     let first = born.0.is_empty();
+    // On the first frame the city resolves out of black row by row from the
+    // Wall outward, after the jack-in's fall through the rain.
+    let start = if first { now + jack.city_delay() } else { now };
+
+    // Processes that exited since the last update start dissolving.
+    for (k, g) in last_seen.drain() {
+        if !m.snapshot.processes.contains_key(&k) {
+            ghosts.push(Ghost { died: now, ..g });
+        }
+    }
+    ghosts.retain(|g| now - g.died < DISSOLVE_SECS);
     born.0.retain(|k, _| m.snapshot.processes.contains_key(k));
+
     let mut dm = DotMesh::default();
     for (id, c) in sl.layout.columns.iter().enumerate() {
         let Some(p) = m.snapshot.processes.get(&c.key) else {
             continue;
         };
-        // Everything present at start grows in together, staggered by distance from the Wall.
         let b = *born.0.entry(c.key).or_insert(if first {
-            now + (c.base.z - sl.layout.min.y) * 0.04
+            start + (c.base.z - sl.layout.min.y).max(0.0) * 0.05
         } else {
             now
         });
-        column_dots(&mut dm, id, c, p, b);
+        let (rgb, kind, cpu) = process_look(p, c.realm);
+        column_dots(&mut dm, id, c, rgb, kind, cpu, b);
+        last_seen.insert(
+            c.key,
+            Ghost {
+                column: c.clone(),
+                rgb,
+                died: 0.0,
+            },
+        );
     }
-    // Volumes: tall 3×3 columns; lit dots are used space, colored by health.
+    for g in ghosts.iter() {
+        column_dots(
+            &mut dm,
+            2 * VOLUME_ID_BASE,
+            &g.column,
+            g.rgb,
+            KIND_DYING,
+            0.0,
+            g.died,
+        );
+    }
+    // Volumes: tall 3×3 columns; lit dots are used space, the rest dot-off.
     for (i, v) in m.snapshot.volumes.iter().enumerate() {
         let base = sl.layout.volume_base(i);
         let levels = (8.0 + (v.total_bytes as f32 / (1u64 << 30) as f32).max(1.0).log2() * 2.0)
@@ -235,14 +310,14 @@ fn rebuild_city(
             for fx in -1..=1 {
                 for fz in -1..=1 {
                     let off = Vec3::new(
-                        fx as f32 * 0.22,
-                        level as f32 * LEVEL_H + 0.07,
-                        fz as f32 * 0.22,
+                        fx as f32 * 0.2,
+                        level as f32 * LEVEL_H + 0.05,
+                        fz as f32 * 0.2,
                     );
                     let lit = if level < used { 1.0 } else { 0.0 };
                     dm.cube(
                         base + off,
-                        0.05,
+                        0.045,
                         [lit, 0.0],
                         [(VOLUME_ID_BASE + i) as f32, KIND_VOLUME],
                         [rgb[0], rgb[1], rgb[2], 0.0],
@@ -256,47 +331,80 @@ fn rebuild_city(
     }
 }
 
+/// The floor is the machine's RAM: one dot per `mb_per_dot`, the dots
+/// nearest the city first, so used memory lights up from the city outward.
 fn rebuild_floor(
+    m: Res<Machine>,
     sl: Res<SceneLayout>,
-    quality: Res<Quality>,
     handles: Res<CityHandles>,
+    mut info: ResMut<FloorInfo>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut last: Local<Option<(Vec2, Vec2, Tier)>>,
+    mut last: Local<Option<(Vec2, Vec2, u64)>>,
 ) {
-    let key = (sl.layout.min, sl.layout.max, quality.tier);
-    if *last == Some(key) {
+    let total = m.snapshot.system.mem_total;
+    let key = (sl.layout.min, sl.layout.max, total);
+    if total == 0 || *last == Some(key) {
         return;
     }
     *last = Some(key);
-    let step = if quality.tier == Tier::Low {
-        CELL
-    } else {
-        CELL * 0.5
-    };
-    let (x0, x1) = (sl.layout.min.x - 14.0, sl.layout.max.x + 14.0);
-    let (z0, z1) = (sl.layout.wall_z() + 0.5, sl.layout.max.y + 16.0);
-    let mut dm = DotMesh::default();
-    let mut seed = 0x51_7CC1_B727_220Au64;
-    let mut z = z0;
-    while z < z1 {
-        let mut x = x0;
-        while x < x1 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let j = (seed >> 40) as f32 / (1u64 << 24) as f32;
-            // Offset by half a cell so floor dots sit between columns.
-            dm.cube(
-                Vec3::new(x + step * 0.5, -0.02, z + step * 0.5),
-                0.022,
-                [j, 0.0],
-                [-5.0, KIND_FLOOR],
-                [0.12, 0.16, 0.5, 0.0],
-            );
-            x += step;
-        }
-        z += step;
+
+    let mut mb = 64u64;
+    while total / (mb << 20) > MAX_FLOOR_DOTS {
+        mb *= 2;
     }
+    let n = (total / (mb << 20)).max(16) as usize;
+    // Spread the dots over the city's footprint plus a margin, at whatever
+    // pitch makes them fit, then keep the n nearest the center.
+    let (min, max) = (
+        sl.layout.min - Vec2::splat(4.0),
+        sl.layout.max + Vec2::splat(6.0),
+    );
+    let area = (max - min).x * (max - min).y;
+    let pitch = (area / n as f32).sqrt().clamp(0.22, 3.0);
+    let mut pts = Vec::new();
+    let mut z = min.y;
+    while z <= max.y {
+        let mut x = min.x;
+        while x <= max.x {
+            pts.push(Vec2::new(x + pitch * 0.5, z + pitch * 0.5));
+            x += pitch;
+        }
+        z += pitch;
+    }
+    // Pad outward if the footprint ran short.
+    let mut ring = 1.0;
+    while pts.len() < n {
+        let r = (max - min).max_element() * 0.5 + ring * pitch;
+        let steps = (std::f32::consts::TAU * r / pitch) as usize;
+        pts.extend(
+            (0..steps)
+                .map(|i| Vec2::from_angle(i as f32 / steps as f32 * std::f32::consts::TAU) * r),
+        );
+        ring += 1.0;
+    }
+    let center = (sl.layout.min + sl.layout.max) * 0.5;
+    pts.sort_by(|a, b| {
+        a.distance_squared(center)
+            .total_cmp(&b.distance_squared(center))
+    });
+    pts.truncate(n);
+
+    let ok = health_color(Health::Healthy, Realm::User);
+    let mut dm = DotMesh::default();
+    for (i, p) in pts.iter().enumerate() {
+        let rank = (i as f32 + 0.5) / n as f32;
+        dm.cube(
+            Vec3::new(p.x, -0.02, p.y),
+            0.022,
+            [rank, 0.0],
+            [-5.0, KIND_FLOOR],
+            [ok[0], ok[1], ok[2], 0.0],
+        );
+    }
+    *info = FloorInfo {
+        mb_per_dot: mb,
+        dots: n,
+    };
     if let Some(mut mesh) = meshes.get_mut(&handles.floor) {
         *mesh = dm.into_mesh();
     }
@@ -316,25 +424,30 @@ fn update_params(
         k.and_then(|k| sl.layout.column_index(&k))
             .map_or(-1.0, |i| i as f32)
     };
-    if let Some(mut mat) = mats.get_mut(&handles.mat) {
-        // Under reduced motion time stands still, far enough in that every column has grown in.
-        let t = if settings.reduced_motion {
-            1e5
-        } else {
-            time.elapsed_secs()
-        };
-        mat.params.a = Vec4::new(
-            t,
-            m.snapshot.system.kernel_pressure,
-            id(sel.key),
-            id(sel.hovered),
-        );
-        let intensity = if quality.tier == Tier::Low { 1.2 } else { 1.0 };
-        mat.params.b = Vec4::new(
-            if settings.issues_only { 1.0 } else { 0.0 },
-            intensity,
-            0.0,
-            0.0,
-        );
-    }
+    let Some(mut mat) = mats.get_mut(&handles.mat) else {
+        return;
+    };
+    // Under reduced motion time stops, far enough in that every column has grown.
+    let t = if settings.reduced_motion {
+        1e5
+    } else {
+        time.elapsed_secs()
+    };
+    let s = &m.snapshot.system;
+    let ram = s.mem_used as f32 / s.mem_total.max(1) as f32;
+    mat.params.a = Vec4::new(t, s.kernel_pressure, id(sel.key), id(sel.hovered));
+    let intensity = if quality.tier == crate::Tier::Low {
+        1.2
+    } else {
+        1.0
+    };
+    mat.params.b = Vec4::new(
+        if settings.issues_only { 1.0 } else { 0.0 },
+        intensity,
+        ram,
+        if settings.reduced_motion { 1.0 } else { 0.0 },
+    );
+    mat.params.c = palette::linear4(palette::DOT_OFF, 0.0);
+    let reach = sl.layout.extent;
+    mat.params.d = Vec4::new(reach + 8.0, reach * 1.8 + 26.0, 0.0, 0.0);
 }
