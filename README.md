@@ -1,19 +1,19 @@
 # Blackwall
 
-A cyberpunk system visualizer: a second world you explore to find what's wrong with your machine. Every process is a monolith of light among other monoliths, standing in the dark in front of the **Blackwall**, the kernel/user boundary, which hangs behind the city as falling magenta rain. Choose a tower and you stand at its foot looking up; dive in and the city falls away. Inside is the process itself: a core of memory strata, its threads as floors, its open files and sockets as conduits leading out into the dark, and its children as satellite towers. Somewhere in there is the small thing that's wrong.
+A cyberpunk system visualizer: a second world you explore to find what's wrong with your machine. Every process is a brutalist tower of dim windows, crowded in among the others in the dark in front of the **Blackwall**, the kernel/user boundary, which hangs behind the city as falling magenta rain. Choose a tower and you stand at its foot looking up; dive in and the city falls away. Inside is the process itself: a monolith of memory slabs, its threads as slabs cantilevered out of it, its open files and sockets as pipes leading out into the dark, and its children as towers crowded round it. Somewhere in there is the small thing that's wrong.
 
 Native Rust (Bevy + egui) for **Linux, Windows and macOS** (process internals are Linux-only so far). No paid code-signing certificates required (see [docs/PLAN.md](docs/PLAN.md) §3.7). Colors come from the Blackwall design system (Claude Design), mirrored in `crates/bw-scene/src/palette.rs`.
 
 > Status: early prototype. See the full [plan](docs/PLAN.md).
 
-![At the foot of a tower](docs/images/machine.png)
+![The city: towers of windows, family cables, IO conduits, and beacons over the processes with issues](docs/images/machine.png)
 
 ## Three levels
 
 | Level | What you see | How you move |
 |---|---|---|
-| **The machine** | Process towers at human scale: taller and denser with memory, brighter with CPU, colored by health. The RAM floor, the rain Wall, kernel threads behind it | Click a tower, Tab through the busiest, or N through the ones with issues: the camera flies to its foot |
-| **Inside a process** | Memory core (one stratum per region: code, libraries, heap, anonymous, files, stacks, each with its own dot pattern), threads as floors, descriptors as conduits (files fall to storage, sockets climb into the dark), children as satellites | Enter or click the chosen tower again to dive; Esc to surface |
+| **The machine** | Process towers, crowded together. Height is memory, with a ledge (and a step in) at 10 MB, 100 MB and 1 GB; width is threads; the share of lit windows is CPU; color is health. Cables join parents to children, conduits carry disk IO to storage, and every process with an issue raises a beacon you can see from anywhere. The RAM floor, the rain Wall, kernel threads behind it | Click a tower, Tab through the busiest, or N through the ones with issues: the camera flies to its foot |
+| **Inside a process** | A monolith of memory slabs (one per region: code, libraries, heap, anonymous, files, stacks, each with its own window pattern, height by size), threads as cantilevered slabs (how far out they reach, and how many windows are lit, is CPU), descriptors as pipes (files fall to storage, sockets climb into the dark), children as towers crowded round. Anomalies raise beacons | Enter or click the chosen tower again to dive; Esc to surface |
 | **An element** | One floor, stratum, conduit or satellite, up close | ↑↓ floors and strata, ←→ conduits and satellites, N the next anomaly, Enter on a satellite to dive into that child |
 
 ![Inside firefox](docs/images/inside.png)
@@ -60,7 +60,7 @@ Everything works from the keyboard; touch and mouse are optional. There is no fr
 | H | Hide all text |
 | Drag, Shift+arrows, wheel, pinch | Look around and zoom at the current spot |
 | Home | Back to the overview |
-| 1–5, M | Family lines, kernel side, streams, labels, issues only; reduced motion |
+| 1–5, M | Family cables, kernel side, IO conduits, labels, issues only; reduced motion |
 | ? | Shortcut sheet |
 
 ## Workspace
@@ -70,7 +70,7 @@ Everything works from the keyboard; touch and mouse are optional. There is no fr
 | `bw-model` | Platform- and engine-free data model: snapshots, deltas, capabilities |
 | `bw-platform` | Per-OS probes behind one `Collector` trait, including process internals from `/proc` on Linux (the only crate allowed `cfg(target_os)`) |
 | `bw-source` | Live and demo sources (replay and remote come later) |
-| `bw-scene` | Bevy scene: city layout, process interiors and anomaly detection, guided exploration, dot mesh + shaders, the Wall, streams, picking, camera, quality tiers |
+| `bw-scene` | Bevy scene: city layout, process interiors and anomaly detection, guided exploration, dot mesh + shaders, the Wall, picking, camera, quality tiers |
 | `bw-ui` | The quiet HUD: breadcrumb, whispers, anomaly compass, summoned panels and search |
 | `blackwall` | The app |
 

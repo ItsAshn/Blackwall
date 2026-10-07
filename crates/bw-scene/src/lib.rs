@@ -12,7 +12,6 @@ pub mod nav;
 pub mod palette;
 mod pick;
 pub mod quality;
-mod streams;
 mod visuals;
 mod wall;
 
@@ -168,7 +167,6 @@ impl Plugin for ScenePlugin {
         city::plugin(app);
         visuals::plugin(app);
         pick::plugin(app);
-        streams::plugin(app);
         camera::plugin(app);
         nav::plugin(app);
         quality::plugin(app);

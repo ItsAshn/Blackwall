@@ -9,7 +9,7 @@
 use crate::camera::JackIn;
 use crate::explore::MachineLayer;
 use crate::interior::{self, ELEMENT_ID_BASE, ElementKind, Interior};
-use crate::layout::{Column, LEVEL_H};
+use crate::layout::{self as lay, Column, LEVEL_H, WINDOW};
 use crate::palette::{self, linear};
 use crate::*;
 use bevy::asset::{RenderAssetUsages, embedded_asset};
@@ -114,6 +114,14 @@ const KIND_CRITICAL: f32 = 4.0;
 const KIND_DYING: f32 = 5.0;
 const KIND_FLOW: f32 = 6.0;
 const KIND_WATCH: f32 = 7.0;
+const KIND_BEACON: f32 = 8.0;
+const KIND_CABLE: f32 = 9.0;
+const KIND_LEDGE: f32 = 10.0;
+const KIND_STRATUM: f32 = 11.0;
+
+/// How high issue beacons climb: well above the tallest tower, so a problem
+/// can be seen from anywhere in the city.
+const BEACON_RISE: f32 = 30.0;
 
 /// How long an exited process takes to dissolve.
 const DISSOLVE_SECS: f32 = 1.2;
@@ -206,7 +214,12 @@ struct Ghost {
     died: f32,
 }
 
-fn column_dots(
+/// A tower as a brutalist facade: windows on its four faces only, one row
+/// per level. The shader lights a share of the windows equal to the CPU; the
+/// rest stay barely visible, so the mass (memory) still reads. At each memory
+/// ledge (10 MB, 100 MB, 1 GB…) a ledge line runs round the tower and it
+/// steps in by a window, alternating sides; the roof gets a ledge too.
+pub(crate) fn tower_dots(
     m: &mut DotMesh,
     id: usize,
     c: &Column,
@@ -215,32 +228,137 @@ fn column_dots(
     cpu: f32,
     time: f32,
 ) {
-    let fp = c.footprint as i32;
-    let spacing = 0.2;
     let half = if c.realm == Realm::Kernel {
         0.035
     } else {
         0.042
     };
+    let col = [rgb[0], rgb[1], rgb[2], time];
+    let ledges: Vec<u32> = lay::ledges(c.levels).collect();
+    // The block still standing: offset and size in windows.
+    let (mut ox, mut oz, mut ex, mut ez) = (0, 0, c.wx as i32, c.wz as i32);
+    let first = c.base - Vec3::new(c.half().x, 0.0, c.half().y)
+        + Vec3::new(WINDOW / 2.0, 0.0, WINDOW / 2.0);
+    let ledge = |m: &mut DotMesh, ox: i32, oz: i32, ex: i32, ez: i32, level: u32| {
+        let y = level as f32 * LEVEL_H - 0.05;
+        let lo = first
+            + Vec3::new(
+                (ox as f32 - 0.5) * WINDOW - 0.04,
+                y,
+                (oz as f32 - 0.5) * WINDOW - 0.04,
+            );
+        let hi = first
+            + Vec3::new(
+                ((ox + ex) as f32 - 0.5) * WINDOW + 0.04,
+                y,
+                ((oz + ez) as f32 - 0.5) * WINDOW + 0.04,
+            );
+        let hf = level as f32 / c.levels as f32;
+        let path = [
+            lo,
+            Vec3::new(hi.x, lo.y, lo.z),
+            Vec3::new(hi.x, lo.y, hi.z),
+            Vec3::new(lo.x, lo.y, hi.z),
+            lo,
+        ];
+        interior::along(&path, 0.1, |p, _| {
+            m.dot(p, half * 0.55, [0.0, hf], [id as f32, KIND_LEDGE], col)
+        });
+    };
+    let mut step = 0;
     for level in 0..c.levels {
+        if ledges.contains(&level) {
+            ledge(m, ox, oz, ex, ez, level);
+            // Step in by one window: x on even ledges, z on odd ones.
+            if step % 2 == 0 {
+                if ex > 2 {
+                    ex -= 1;
+                    ox += step / 2 % 2;
+                }
+            } else if ez > 2 {
+                ez -= 1;
+                oz += step / 2 % 2;
+            }
+            step += 1;
+        }
         let hfrac = (level as f32 + 0.5) / c.levels as f32;
-        for fx in 0..fp {
-            for fz in 0..fp {
-                let off = Vec3::new(
-                    (fx as f32 - (fp - 1) as f32 / 2.0) * spacing,
-                    level as f32 * LEVEL_H + half,
-                    (fz as f32 - (fp - 1) as f32 / 2.0) * spacing,
-                );
-                m.dot(
-                    c.base + off,
-                    half,
-                    [cpu, hfrac],
-                    [id as f32, kind],
-                    [rgb[0], rgb[1], rgb[2], time],
-                );
+        for ix in 0..ex {
+            for iz in 0..ez {
+                if ix > 0 && ix < ex - 1 && iz > 0 && iz < ez - 1 {
+                    continue;
+                }
+                let p = first
+                    + Vec3::new(
+                        (ox + ix) as f32 * WINDOW,
+                        level as f32 * LEVEL_H + half,
+                        (oz + iz) as f32 * WINDOW,
+                    );
+                m.dot(p, half, [cpu, hfrac], [id as f32, kind], col);
             }
         }
     }
+    ledge(m, ox, oz, ex, ez, c.levels);
+}
+
+/// A beam of light climbing from `from` into the dark: issues are visible
+/// from anywhere. Critical beams are brighter and faster than watch beams.
+pub(crate) fn beacon(m: &mut DotMesh, id: usize, from: Vec3, rise: f32, health: Health, time: f32) {
+    let rgb = health_color(health, Realm::User);
+    let crit = if health == Health::Critical { 1.0 } else { 0.0 };
+    let n = (rise / 0.09) as usize;
+    for i in 0..n {
+        let u = i as f32 / n as f32;
+        m.dot(
+            from + Vec3::Y * (0.25 + u * rise),
+            0.038,
+            [crit, u],
+            [id as f32, KIND_BEACON],
+            [rgb[0], rgb[1], rgb[2], time],
+        );
+    }
+}
+
+/// A sagging cable of dots from `a` to `b`, with slow pulses running from a
+/// to b: a relationship (parent → child) that is always there.
+pub(crate) fn cable(m: &mut DotMesh, id: usize, a: Vec3, b: Vec3, rgb: [f32; 3], time: f32) {
+    let len = a.distance(b);
+    let sag = 0.12 * len + 0.15;
+    let n = (len / 0.11).max(2.0) as usize;
+    let pulses = (len / 3.0).max(1.0);
+    for i in 0..=n {
+        let u = i as f32 / n as f32;
+        let p = a.lerp(b, u) - Vec3::Y * sag * 4.0 * u * (1.0 - u);
+        m.dot(
+            p,
+            0.022,
+            [pulses, u],
+            [id as f32, KIND_CABLE],
+            [rgb[0], rgb[1], rgb[2], time],
+        );
+    }
+}
+
+/// A conduit of flowing dots along a polyline; `rate` 0..1 sets how dense
+/// the pulses run (IO volume).
+pub(crate) fn conduit(
+    m: &mut DotMesh,
+    id: usize,
+    path: &[Vec3],
+    rate: f32,
+    rgb: [f32; 3],
+    time: f32,
+) {
+    let len: f32 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let pulses = (len / 2.5 * (0.3 + rate * 2.2)).max(1.0);
+    interior::along(path, 0.09, |p, u| {
+        m.dot(
+            p,
+            0.026,
+            [pulses, u],
+            [id as f32, KIND_FLOW],
+            [rgb[0], rgb[1], rgb[2], time],
+        )
+    });
 }
 
 fn process_look(p: &Process, realm: Realm) -> ([f32; 3], f32, f32) {
@@ -253,7 +371,8 @@ fn process_look(p: &Process, realm: Realm) -> ([f32; 3], f32, f32) {
     (
         health_color(health, realm),
         kind,
-        (p.cpu_pct / 100.0).clamp(0.0, 1.0).sqrt(),
+        // The share of windows lit: CPU, linear, so it can be read.
+        (p.cpu_pct / 100.0).clamp(0.0, 1.0),
     )
 }
 
@@ -264,15 +383,17 @@ fn rebuild_city(
     time: Res<Time>,
     jack: Res<JackIn>,
     handles: Res<CityHandles>,
+    settings: Res<SceneSettings>,
     mut born: ResMut<Born>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut last_gen: Local<u64>,
     mut last_seen: Local<HashMap<ProcKey, Ghost>>,
     mut ghosts: Local<Vec<Ghost>>,
 ) {
-    if m.generation == *last_gen {
+    if m.generation == *last_gen && !settings.is_changed() {
         return;
     }
+    let fresh = m.generation != *last_gen;
     *last_gen = m.generation;
     let now = time.elapsed_secs();
     let first = born.0.is_empty();
@@ -281,9 +402,11 @@ fn rebuild_city(
     let start = if first { now + jack.city_delay() } else { now };
 
     // Processes that exited since the last update start dissolving.
-    for (k, g) in last_seen.drain() {
-        if !m.snapshot.processes.contains_key(&k) {
-            ghosts.push(Ghost { died: now, ..g });
+    if fresh {
+        for (k, g) in last_seen.drain() {
+            if !m.snapshot.processes.contains_key(&k) {
+                ghosts.push(Ghost { died: now, ..g });
+            }
         }
     }
     ghosts.retain(|g| now - g.died < DISSOLVE_SECS);
@@ -300,7 +423,53 @@ fn rebuild_city(
             now
         });
         let (rgb, kind, cpu) = process_look(p, c.realm);
-        column_dots(&mut dm, id, c, rgb, kind, cpu, b);
+        tower_dots(&mut dm, id, c, rgb, kind, cpu, b);
+        let health = p.health();
+        if health != Health::Healthy && c.realm == Realm::User {
+            beacon(&mut dm, id, c.top(), BEACON_RISE, health, b);
+        }
+        // Family: a cable from the parent's tower to this one.
+        if let Some(pc) = p
+            .parent
+            .and_then(|pk| sl.layout.column(&pk))
+            .filter(|pc| settings.show_links && pc.realm == Realm::User && c.realm == Realm::User)
+        {
+            let h = pc.height().min(c.height()) * 0.85;
+            cable(
+                &mut dm,
+                id,
+                pc.base + Vec3::Y * h,
+                c.base + Vec3::Y * h,
+                health_color(Health::Healthy, Realm::User),
+                b,
+            );
+        }
+        // Disk IO: a conduit along the floor to the storage it lands on.
+        let io = (p.io_read_bytes + p.io_write_bytes) as f32;
+        if settings.show_streams
+            && c.realm == Realm::User
+            && !m.snapshot.volumes.is_empty()
+            && (io > 4096.0 || p.state == bw_model::ProcState::DiskWait)
+        {
+            // Down the tower's face, along its alley, then up the city's
+            // west edge in a trunk of parallel lanes to the volumes.
+            let v = sl.layout.volume_base(0);
+            let y = 0.03;
+            let lane = ((p.key.pid % 9) as f32 - 4.0) * 0.06;
+            let face = c.base + Vec3::new(lane * 0.5, 0.0, c.half().y + 0.06);
+            let alley = face.z + 0.42 + lane * 0.3;
+            let trunk = sl.layout.min.x - 0.6 + lane;
+            let path = [
+                face + Vec3::Y * c.height() * 0.5,
+                face + Vec3::Y * y,
+                Vec3::new(face.x, y, alley),
+                Vec3::new(trunk, y, alley),
+                Vec3::new(trunk, y, v.z + lane),
+                Vec3::new(v.x, y, v.z + lane),
+            ];
+            let rate = ((io / 4096.0).max(1.0).log10() / 4.0).clamp(0.0, 1.0);
+            conduit(&mut dm, id, &path, rate, rgb, b);
+        }
         last_seen.insert(
             c.key,
             Ghost {
@@ -311,7 +480,7 @@ fn rebuild_city(
         );
     }
     for g in ghosts.iter() {
-        column_dots(
+        tower_dots(
             &mut dm,
             2 * VOLUME_ID_BASE,
             &g.column,
@@ -441,6 +610,7 @@ fn update_params(
     time: Res<Time>,
     handles: Res<CityHandles>,
     ex: Res<crate::explore::Explore>,
+    cam: Res<crate::camera::OrbitCam>,
     mut mats: ResMut<Assets<DotsMaterial>>,
 ) {
     let id = |k: Option<ProcKey>| {
@@ -480,11 +650,13 @@ fn update_params(
         if settings.reduced_motion { 1.0 } else { 0.0 },
     );
     mat.params.c = palette::linear4(palette::DOT_OFF, 0.0);
-    let reach = sl.layout.extent;
+    // Fog from the eye, scaled to how far out the camera stands: close in,
+    // the city crowds round and its far side is lost in the dark.
+    let cd = cam.dist;
     mat.params.d = if ex.inside().is_some() {
-        Vec4::new(42.0, 95.0, 0.0, 0.0)
+        Vec4::new(cd * 1.1 + 16.0, cd * 2.4 + 45.0, 0.0, 0.0)
     } else {
-        Vec4::new(reach + 8.0, reach * 1.8 + 26.0, 0.0, 0.0)
+        Vec4::new(cd * 0.8 + 4.0, cd * 1.9 + 16.0, 0.0, 0.0)
     };
 }
 
@@ -507,10 +679,10 @@ pub(crate) fn interior_mesh(
     born: f32,
     _now: f32,
 ) -> Mesh {
-    use std::f32::consts::TAU;
     let mut m = DotMesh::default();
+    let per_face = (2.0 * interior::CORE_R / interior::CORE_WINDOW).round() as usize;
     for (i, e) in it.elements.iter().enumerate() {
-        let id = (ELEMENT_ID_BASE + i) as f32;
+        let id = ELEMENT_ID_BASE + i;
         let rgb = interior::health_rgb(e.health);
         let kind = element_kind(e.health);
         let b = born + i as f32 * 0.003;
@@ -519,66 +691,105 @@ pub(crate) fn interior_mesh(
             ElementKind::Stratum { region } => {
                 let r = &d.regions[*region];
                 let levels = ((e.max.y - e.min.y) / LEVEL_H).round().max(1.0) as usize;
-                for lv in 0..levels {
+                // The bottom row of each slab stays dark: a seam between slabs.
+                for lv in 1..levels {
                     let y = e.min.y + lv as f32 * LEVEL_H + 0.05;
-                    for k in 0..48 {
-                        if !interior::stratum_keep(r.kind, k, lv) {
-                            continue;
+                    for f in 0..4 {
+                        let (out, side) = interior::face(f);
+                        for k in 0..per_face {
+                            if !interior::stratum_keep(r.kind, f * per_face + k, lv) {
+                                continue;
+                            }
+                            let off = (k as f32 + 0.5) * interior::CORE_WINDOW - interior::CORE_R;
+                            let pos = out * interior::CORE_R + side * off + Vec3::Y * y;
+                            let kind = if e.health == Health::Healthy {
+                                KIND_STRATUM
+                            } else {
+                                kind
+                            };
+                            m.dot(
+                                pos,
+                                0.045,
+                                [0.5, lv as f32 / levels as f32],
+                                [id as f32, kind],
+                                col,
+                            );
                         }
-                        let ang = k as f32 / 48.0 * TAU + lv as f32 * 0.013;
-                        let pos = Vec3::new(
-                            ang.cos() * interior::CORE_R,
-                            y,
-                            ang.sin() * interior::CORE_R,
-                        );
-                        m.dot(
-                            pos,
-                            0.045,
-                            [0.12, lv as f32 / levels as f32],
-                            [id, kind],
-                            col,
-                        );
                     }
                 }
+                // A ledge caps the slab.
+                let y = e.max.y - 0.02;
+                let r = interior::CORE_R + 0.12;
+                let ring = [
+                    Vec3::new(-r, y, -r),
+                    Vec3::new(r, y, -r),
+                    Vec3::new(r, y, r),
+                    Vec3::new(-r, y, r),
+                    Vec3::new(-r, y, -r),
+                ];
+                interior::along(&ring, 0.08, |p, _| {
+                    m.dot(p, 0.026, [0.0, 1.0], [id as f32, KIND_LEDGE], col)
+                });
             }
             ElementKind::Floor { thread } => {
+                // A cantilevered slab: its outline at two heights, windows
+                // lit by the thread's CPU.
                 let t = &d.threads[*thread];
-                let cpu = (t.cpu_pct / 100.0).clamp(0.0, 1.0).sqrt();
-                let y = e.anchor.y;
-                let h = interior::PLATE;
-                let corners = [
-                    Vec3::new(-h, y, -h),
-                    Vec3::new(h, y, -h),
-                    Vec3::new(h, y, h),
-                    Vec3::new(-h, y, h),
-                    Vec3::new(-h, y, -h),
-                ];
-                interior::along(&corners, 0.3, |p, u| {
-                    m.dot(p, 0.05, [cpu, u], [id, kind], col)
-                });
+                let cpu = (t.cpu_pct / 100.0).clamp(0.0, 1.0);
+                let (lo, hi) = (e.min + Vec3::splat(0.12), e.max - Vec3::splat(0.12));
+                // The deck: a grid of windows, so the slab has mass.
+                let (nx, nz) = (
+                    ((hi.x - lo.x) / 0.3).round().max(1.0) as usize,
+                    ((hi.z - lo.z) / 0.3).round().max(1.0) as usize,
+                );
+                for ix in 1..nx {
+                    for iz in 1..nz {
+                        let p = Vec3::new(
+                            lo.x + (hi.x - lo.x) * ix as f32 / nx as f32,
+                            hi.y,
+                            lo.z + (hi.z - lo.z) * iz as f32 / nz as f32,
+                        );
+                        m.dot(p, 0.04, [cpu, 0.5], [id as f32, kind], col);
+                    }
+                }
+                for (row, y) in [lo.y, hi.y].into_iter().enumerate() {
+                    let rect = [
+                        Vec3::new(lo.x, y, lo.z),
+                        Vec3::new(hi.x, y, lo.z),
+                        Vec3::new(hi.x, y, hi.z),
+                        Vec3::new(lo.x, y, hi.z),
+                        Vec3::new(lo.x, y, lo.z),
+                    ];
+                    interior::along(&rect, 0.2, |p, u| {
+                        m.dot(
+                            p,
+                            0.045,
+                            [cpu, row as f32 * 0.5 + u * 0.5],
+                            [id as f32, kind],
+                            col,
+                        )
+                    });
+                }
             }
             ElementKind::Conduit { .. } => {
-                interior::along(&e.path, 0.32, |p, u| {
-                    m.dot(p, 0.035, [0.3, u], [id, KIND_FLOW], col)
-                });
+                conduit(&mut m, id, &e.path, 0.6, rgb, b);
             }
             ElementKind::Satellite { child } => {
                 if let Some(c) = snap.processes.get(child) {
                     let base = (e.min + e.max) * 0.5;
-                    let column = crate::layout::Column {
-                        key: c.key,
-                        base: Vec3::new(base.x, 0.0, base.z),
-                        footprint: crate::layout::footprint(c),
-                        levels: crate::layout::levels(c),
-                        realm: c.realm,
-                    };
+                    let column = Column::for_process(c, Vec3::new(base.x, 0.0, base.z));
                     let (crgb, ckind, cpu) = process_look(c, c.realm);
-                    column_dots(&mut m, ELEMENT_ID_BASE + i, &column, crgb, ckind, cpu, b);
+                    tower_dots(&mut m, id, &column, crgb, ckind, cpu, b);
                 }
-                interior::along(&e.path, 0.4, |p, u| {
-                    m.dot(p, 0.03, [0.1, u], [id, KIND_FLOW], col)
-                });
+                if let [a, z] = e.path[..] {
+                    cable(&mut m, id, a, z, rgb, b);
+                }
             }
+        }
+        // Anything wrong raises a beacon over the whole interior.
+        if e.health != Health::Healthy {
+            let from = Vec3::new(e.anchor.x, e.max.y, e.anchor.z);
+            beacon(&mut m, id, from, it.height + 20.0 - from.y, e.health, b);
         }
     }
     m.into_mesh()

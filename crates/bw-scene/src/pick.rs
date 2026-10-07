@@ -54,12 +54,12 @@ fn pick(
             .iter()
             .filter(|c| settings.show_kernel || c.realm == bw_model::Realm::User)
             .filter_map(|c| {
-                let r = 0.18 + c.footprint as f32 * 0.12;
+                let h = c.half() + Vec2::splat(0.08);
                 ray_box(
                     ray.origin,
                     dir,
-                    c.base - Vec3::new(r, 0.0, r),
-                    c.top() + Vec3::new(r, 0.1, r),
+                    c.base - Vec3::new(h.x, 0.0, h.y),
+                    c.top() + Vec3::new(h.x, 0.1, h.y),
                 )
                 .map(|t| (t, c.key))
             })

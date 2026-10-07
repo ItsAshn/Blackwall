@@ -2,13 +2,11 @@
 //! process entities (for labels, camera follow and navigation) and the
 //! family lines of the selection (PLAN §6, v3 look).
 
-use crate::city::health_color;
 use crate::layout::Subsystem;
 use crate::quality::Quality;
 use crate::wall::WallMaterial;
 use crate::*;
 use bevy::color::LinearRgba;
-use bw_model::{Health, ProcState, Realm};
 
 pub(crate) fn plugin(app: &mut App) {
     app.add_systems(Startup, setup).add_systems(
@@ -114,7 +112,7 @@ fn track_columns(
             continue;
         };
         shown.pos = shown.pos.lerp(c.top(), k);
-        shown.radius = 0.15 + c.footprint as f32 * 0.12;
+        shown.radius = c.half().max_element() + 0.1;
         tf.translation = shown.pos;
     }
 }
@@ -216,53 +214,18 @@ fn update_labels(
     }
 }
 
-fn line_color(h: Health, realm: Realm, k: f32) -> Color {
-    let [r, g, b] = health_color(h, realm);
-    Color::LinearRgba(LinearRgba::rgb(r * k, g * k, b * k))
-}
-
-/// Family lines along the floor for the selection (and for everything when
-/// "tree links" is on), plus a tether from stuck-in-IO processes through the
-/// Wall to the storage district.
+/// A short white beam above the selected tower. Family and IO are drawn as
+/// cables and conduits in the dot mesh (`city.rs`).
 fn draw_lines(
-    m: Res<Machine>,
     sl: Res<SceneLayout>,
-    settings: Res<SceneSettings>,
     sel: Res<Selection>,
+    ex: Res<crate::explore::Explore>,
     mut gizmos: Gizmos,
 ) {
-    let lay = &sl.layout;
-    let floor = Vec3::Y * 0.02;
-    let storage = lay.district_pos(Subsystem::Storage);
-    for c in &lay.columns {
-        let Some(p) = m.snapshot.processes.get(&c.key) else {
-            continue;
-        };
-        if p.state == ProcState::DiskWait {
-            gizmos.line(
-                c.base + floor,
-                storage + floor,
-                line_color(Health::Critical, Realm::User, 1.5),
-            );
-        }
-        let Some(parent) = p.parent.and_then(|k| lay.column(&k)) else {
-            continue;
-        };
-        let family = sel.key == Some(c.key) || sel.key == Some(parent.key);
-        if family {
-            // Right-angled, like streets: along x, then along z.
-            let corner = Vec3::new(parent.base.x, 0.0, c.base.z) + floor;
-            let col = line_color(p.health(), c.realm, 3.0);
-            gizmos.line(c.base + floor, corner, col);
-            gizmos.line(corner, parent.base + floor, col);
-        } else if settings.show_links && c.realm == Realm::User {
-            gizmos.line(
-                c.base + floor,
-                parent.base + floor,
-                line_color(p.health(), c.realm, 0.35),
-            );
-        }
+    if ex.inside().is_some() {
+        return;
     }
+    let lay = &sl.layout;
     // A beam above the selected column.
     if let Some(c) = sel.key.and_then(|k| lay.column(&k)) {
         gizmos.line(

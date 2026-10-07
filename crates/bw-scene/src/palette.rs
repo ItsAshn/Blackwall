@@ -6,7 +6,8 @@ pub const VOID: u32 = 0x000000;
 pub const SIGNAL: u32 = 0xe8f6ff;
 pub const SIGNAL_DIM: u32 = 0x5a80c4;
 pub const SELECT: u32 = 0xffffff;
-pub const HEALTH_OK: u32 = 0x4fc3ff;
+/// Cold steel: the healthy majority stays quiet so issues can shout.
+pub const HEALTH_OK: u32 = 0x5f8fbf;
 pub const HEALTH_WATCH: u32 = 0xb25cff;
 pub const HEALTH_ISSUE: u32 = 0xff2440;
 pub const KERNEL: u32 = 0x7a6cff;

@@ -42,7 +42,7 @@ struct DotParams {
     b: vec4<f32>,
     // rgb: dot-off (linear), w: unused
     c: vec4<f32>,
-    // x: fog start, y: fog end (world units from the city's center), zw: unused
+    // x: fog start, y: fog end (world units from the eye), zw: unused
     d: vec4<f32>,
 };
 
@@ -56,9 +56,17 @@ const KIND_CRITICAL: f32 = 4.0;
 const KIND_DYING: f32 = 5.0;
 const KIND_FLOW: f32 = 6.0;
 const KIND_WATCH: f32 = 7.0;
+const KIND_BEACON: f32 = 8.0;
+const KIND_CABLE: f32 = 9.0;
+const KIND_LEDGE: f32 = 10.0;
+const KIND_STRATUM: f32 = 11.0;
 
 fn hash11(x: f32) -> f32 {
     return fract(sin(x * 127.1 + 3.7) * 43758.5453);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+    return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
 }
 
 fn is_kind(k: f32, want: f32) -> bool {
@@ -77,7 +85,9 @@ fn vertex(v: Vertex) -> VertexOutput {
     let center = (get_world_from_local(v.instance_index) * vec4<f32>(v.position, 1.0)).xyz;
     // Billboard in view space, so every dot is round from any angle.
     let in_view = view.view_from_world * vec4<f32>(center, 1.0);
-    let spread = vec4<f32>(v.normal.xy * v.normal.z, 0.0, 0.0);
+    // Dots right at the eye would fill the screen: cap their size by depth.
+    let depth = max(-in_view.z, 0.01);
+    let spread = vec4<f32>(v.normal.xy * min(v.normal.z, depth * 0.03), 0.0, 0.0);
     out.clip = view.clip_from_view * (in_view + spread);
     out.world_position = center;
     out.corner = v.normal.xy;
@@ -92,7 +102,7 @@ fn vertex(v: Vertex) -> VertexOutput {
 fn glow(corner: vec2<f32>) -> vec2<f32> {
     let d = length(corner);
     let core = (1.0 - smoothstep(0.08, 0.17, d)) + exp(-d * d * 260.0) * 0.8;
-    let halo = exp(-d * d * 10.0) * 0.16 + exp(-d * d * 45.0) * 0.7;
+    let halo = exp(-d * d * 14.0) * 0.1 + exp(-d * d * 60.0) * 0.55;
     return vec2<f32>(core, halo * (1.0 - smoothstep(0.85, 1.0, d)));
 }
 
@@ -140,14 +150,36 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             if (uv.y > grow + 0.001) {
                 discard;
             }
-            let cpu = uv.x;
             if (is_kind(kind, KIND_FLOW)) {
-                // A conduit: dots flowing along its path.
-                b = 0.22 + pow(fract(uv.y * 14.0 - t * 0.7 + phase), 10.0) * 2.4;
+                // A conduit: pulses flowing along it; uv.x pulses per path.
+                b = 0.08 + pow(fract(uv.y * uv.x - t * 0.5 + phase), 12.0) * 1.5;
+            } else if (is_kind(kind, KIND_CABLE)) {
+                // A family cable: dim, with rare slow pulses parent → child.
+                b = 0.1 + pow(fract(uv.y * uv.x - t * 0.15 + phase), 16.0) * 0.9;
+            } else if (is_kind(kind, KIND_LEDGE)) {
+                b = 0.1;
+            } else if (is_kind(kind, KIND_STRATUM)) {
+                b = 0.42;
+            } else if (is_kind(kind, KIND_BEACON)) {
+                // An issue's beam: bright, climbing, fading as it rises.
+                let crit = uv.x;
+                let pulse = pow(fract(uv.y * 5.0 - t * (0.35 + crit * 0.5) + phase), 6.0);
+                b = (0.9 + crit * 0.8 + pulse * (2.0 + crit * 2.0)) * pow(1.0 - uv.y, 1.5);
             } else {
-                let f = fract(uv.y * 1.5 - t * (0.12 + cpu * 1.4) + phase);
-                let pulse = pow(f, 14.0) * (0.6 + cpu * 5.0);
-                b = 0.3 + cpu * 1.6 + pulse;
+                // Windows: CPU is the share lit (linear, so it reads); each
+                // window keeps its state for 5-14 s, then may switch.
+                var share = 0.03 + uv.x * 0.97;
+                if (is_kind(kind, KIND_CRITICAL)) {
+                    share = max(share, 0.45);
+                }
+                let h = hash31(in.world_position * 7.31);
+                let epoch = floor(t / (5.0 + h * 9.0) + h * 13.0);
+                if (hash11(h * 917.0 + epoch * 1.37) < share) {
+                    b = 0.8 + h * 0.3;
+                } else {
+                    // Dark windows still show the mass: memory.
+                    b = 0.045;
+                }
             }
             if (is_kind(kind, KIND_WATCH) && !reduced) {
                 // Worth watching: a slow breath, so it can be spotted from afar.
@@ -160,7 +192,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
                 } else {
                     b = b * (0.35 + 1.25 * step(0.5, fract(t * 1.3 + phase)));
                 }
-            } else if (params.b.x > 0.5 && !is_kind(kind, KIND_WATCH)) {
+            } else if (params.b.x > 0.5 && !is_kind(kind, KIND_WATCH) && !is_kind(kind, KIND_BEACON)) {
                 b = b * 0.08;
             }
             if (is_kind(kind, KIND_KERNEL)) {
@@ -177,9 +209,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Distance fog into the void: nothing has an edge or a horizon.
-    let r = length(in.world_position.xz);
-    let fog = 1.0 - smoothstep(params.d.x, params.d.y, r);
+    // Fog into the void, by distance from the eye: the city crowds in and
+    // its far side sinks into black. Nothing has an edge or a horizon.
+    let r = distance(in.world_position, view.world_position);
+    let fog = (1.0 - smoothstep(params.d.x, params.d.y, r)) * smoothstep(0.6, 2.5, r);
     // The core keeps the dot's light (and burns whiter); the halo carries its
     // hue out into the dark. Alpha 0: additive (premultiplied) blending.
     let core = mix(rgb, vec3<f32>(max(rgb.r, max(rgb.g, rgb.b))), 0.25) * g.x * 1.6;

@@ -1,28 +1,38 @@
 //! The inside of a process: a world of its own you dive into.
 //!
-//! * **Core:** the memory map as stacked strata of dot rings, one band per
-//!   region (code, libraries, heap, anonymous, files, stacks). Band height
-//!   follows size; dot pattern follows kind, so kinds read without color.
-//! * **Floors:** one per thread, a square plate of dots ringing the core.
-//!   Brightness and the pulse running around the plate are the thread's CPU.
-//! * **Conduits:** open descriptors as lines of flowing dots leaving the
-//!   floors: files drop toward storage below, sockets climb out into the
-//!   dark, pipes and events stay close.
-//! * **Satellites:** child processes as smaller towers on bridges.
+//! * **Core:** a square brutalist monolith; the memory map is its stacked
+//!   slabs, one per region (code, libraries, heap, anonymous, files,
+//!   stacks), each capped by a ledge. Slab height follows size; the window
+//!   pattern follows kind, so kinds read without color.
+//! * **Floors:** one per thread, a slab cantilevered out of the core, faces
+//!   taking turns. How far it projects is the thread's CPU, and so is the
+//!   share of its windows that are lit.
+//! * **Conduits:** open descriptors as pipes of flowing dots: straight out of
+//!   the core, then files drop to storage below, sockets climb into the
+//!   dark, pipes and events run along the face.
+//! * **Satellites:** child processes as towers crowded round, cabled to it.
 //!
-//! Color is health only; anomalies blink red or glow violet. Pure functions
-//! build the model; one Bevy system turns it into a dot mesh.
+//! Color is health only; anomalies blink red or glow violet and raise a
+//! beacon. Pure functions build the model; one Bevy system turns it into a
+//! dot mesh.
 
 use crate::layout::LEVEL_H;
 use crate::palette::{self, linear};
 use bevy::math::Vec3;
 use bw_model::{FdKind, Health, ProcKey, ProcState, Process, ProcessDetail, RegionKind, Snapshot};
-use std::f32::consts::TAU;
 
 /// Ids for interior elements in the dot shader's selection uniform.
 pub const ELEMENT_ID_BASE: usize = 3_000_000;
-pub const PLATE: f32 = 6.0;
+/// Half the width of the core monolith.
 pub const CORE_R: f32 = 2.4;
+/// Window pitch on the core's faces.
+pub const CORE_WINDOW: f32 = 0.3;
+/// Longest a thread's slab projects (at 100% CPU), plus the stub every
+/// thread has.
+pub const SLAB_MAX: f32 = 6.0;
+const SLAB_MIN: f32 = 0.9;
+/// Where conduits turn, clear of the longest slab.
+const CONDUIT_OUT: f32 = CORE_R + SLAB_MIN + SLAB_MAX + 1.4;
 const MAX_CONDUITS: usize = 96;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,16 +192,20 @@ pub fn build(p: &Process, d: &ProcessDetail, snap: &Snapshot, anomalies: &[Anoma
 
     // Floors: evenly up the core's height (taller if there are many threads).
     let n = d.threads.len().max(1);
-    let span = core_top.max(n as f32 * 0.7);
+    let span = core_top.max(n as f32 * 0.5);
     for (i, t) in d.threads.iter().enumerate() {
         let fy = 0.6 + i as f32 * span / n as f32;
+        let (out, side) = face(i);
+        let reach_out = slab_len(t.cpu_pct);
+        let a0 = out * (CORE_R + 0.15) - side * (CORE_R * 0.8) + Vec3::Y * (fy - LEVEL_H);
+        let a1 = out * (CORE_R + 0.15 + reach_out) + side * (CORE_R * 0.8) + Vec3::Y * fy;
         let kind = ElementKind::Floor { thread: i };
         let a = flagged(&kind);
         elements.push(Element {
-            anchor: Vec3::new(PLATE * 0.6, fy, PLATE * 0.6),
-            reach: 13.0,
-            min: Vec3::new(-PLATE - 0.3, fy - 0.25, -PLATE - 0.3),
-            max: Vec3::new(PLATE + 0.3, fy + 0.25, PLATE + 0.3),
+            anchor: (a0 + a1) * 0.5,
+            reach: 9.0 + reach_out * 0.6,
+            min: a0.min(a1) - Vec3::splat(0.12),
+            max: a0.max(a1) + Vec3::splat(0.12),
             label: format!("{} · tid {} · {:.0}%", t.name, t.tid, t.cpu_pct),
             health: a.map_or(thread_health(t.state, t.cpu_pct), |a| a.health),
             anomaly: a.map(|a| a.text.clone()),
@@ -227,29 +241,42 @@ pub fn build(p: &Process, d: &ProcessDetail, snap: &Snapshot, anomalies: &[Anoma
         });
     }
 
-    // Satellites: children on a ring, each joined by a bridge at the base.
+    // Satellites: children crowded in rows along the core's faces, beyond
+    // the conduits, each cabled to the core.
     let kids: Vec<&Process> = snap
         .processes
         .values()
         .filter(|c| c.parent == Some(p.key))
         .collect();
     for (i, c) in kids.iter().enumerate() {
-        let ang = i as f32 / kids.len().max(1) as f32 * TAU + 0.4;
-        let pos = Vec3::new(ang.cos() * 26.0, 0.0, ang.sin() * 26.0);
-        let h = crate::layout::levels(c) as f32 * LEVEL_H;
+        let (out, side) = face(i);
+        let slot = (i / 4) as f32;
+        let sign = if (slot as usize).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
+        let along = (slot / 2.0).ceil() * sign * 1.6;
+        let pos = out * (CONDUIT_OUT + 2.5 + (i / 12) as f32 * 1.8) + side * along;
+        let col = crate::layout::Column::for_process(c, pos);
+        let h = col.height();
+        let hw = col.half();
         let kind = ElementKind::Satellite { child: c.key };
         elements.push(Element {
             anchor: pos + Vec3::Y * h * 0.5,
-            reach: 8.0 + h * 0.5,
-            min: pos - Vec3::new(1.0, 0.0, 1.0),
-            max: pos + Vec3::new(1.0, h, 1.0),
+            reach: 6.0 + h * 0.5,
+            min: pos - Vec3::new(hw.x + 0.1, 0.0, hw.y + 0.1),
+            max: pos + Vec3::new(hw.x + 0.1, h, hw.y + 0.1),
             label: format!("{} · {}", c.name, c.key.pid),
             health: c.health(),
             anomaly: c
                 .health_reason()
                 .filter(|_| c.health() != Health::Healthy)
                 .map(String::from),
-            path: vec![pos, pos.normalize_or_zero() * (PLATE + 0.5)],
+            path: vec![
+                out * CORE_R + Vec3::Y * (h * 0.8),
+                pos + Vec3::Y * (h * 0.8),
+            ],
             kind,
         });
     }
@@ -262,23 +289,38 @@ pub fn build(p: &Process, d: &ProcessDetail, snap: &Snapshot, anomalies: &[Anoma
     }
 }
 
-/// The path of the k-th of n conduits: out from its floor's plate, then
-/// down to storage (files), up into the dark (sockets) or round (pipes).
+/// Outward normal and sideways direction of the core face `i` (mod 4).
+pub fn face(i: usize) -> (Vec3, Vec3) {
+    match i % 4 {
+        0 => (Vec3::X, Vec3::Z),
+        1 => (Vec3::Z, -Vec3::X),
+        2 => (-Vec3::X, -Vec3::Z),
+        _ => (-Vec3::Z, Vec3::X),
+    }
+}
+
+/// How far a thread's slab projects from the core.
+pub fn slab_len(cpu_pct: f32) -> f32 {
+    SLAB_MIN + (cpu_pct / 100.0).clamp(0.0, 1.0) * SLAB_MAX
+}
+
+/// The path of the k-th of n conduits, like pipes on a building: straight
+/// out of a core face, then files drop to storage below, sockets climb into
+/// the dark, devices go to the ground, pipes and events run along the face.
 pub fn conduit_path(k: usize, n: usize, kind: FdKind, span: f32) -> Vec<Vec3> {
-    let ang = (k as f32 + 0.5) / n.max(1) as f32 * TAU * 3.0;
-    let dir = Vec3::new(ang.cos(), 0.0, ang.sin());
+    let (out, side) = face(k);
+    let slot = (k / 4) % 13;
+    let off = (slot as f32 / 12.0 * 2.0 - 1.0) * CORE_R * 0.9;
     let y = 0.6 + (k as f32 / n.max(1) as f32) * span;
-    // Leave from the plate's edge (a square of half-size PLATE).
-    let edge = dir * (PLATE / dir.x.abs().max(dir.z.abs()).max(1e-3));
-    let start = edge + Vec3::Y * y;
-    let out = start + dir * 6.0;
+    let start = out * (CORE_R + 0.05) + side * off + Vec3::Y * y;
+    let turn = out * (CONDUIT_OUT + ((k / 4) % 3) as f32 * 0.5) + side * off + Vec3::Y * y;
     let end = match kind {
-        FdKind::File => out + dir * 4.0 - Vec3::Y * (y + 8.0),
-        FdKind::Socket => out + dir * 22.0 + Vec3::Y * 14.0,
-        FdKind::Device => out + dir * 2.0,
-        FdKind::Pipe | FdKind::Event | FdKind::Other => out + Vec3::new(-dir.z, 0.0, dir.x) * 6.0,
+        FdKind::File => turn - Vec3::Y * (y + 6.0),
+        FdKind::Socket => turn + Vec3::Y * (span + 16.0 - y),
+        FdKind::Device => turn - Vec3::Y * y,
+        FdKind::Pipe | FdKind::Event | FdKind::Other => turn + side * 3.0,
     };
-    vec![start, out, end]
+    vec![start, turn, end]
 }
 
 /// Square dots along a polyline at `pitch`; calls `f(point, t)` with t in 0..1.
@@ -296,15 +338,17 @@ pub fn along(pts: &[Vec3], pitch: f32, mut f: impl FnMut(Vec3, f32)) {
     }
 }
 
-/// Dot pattern per region kind, so strata read without color: which of a
-/// ring's 48 dots are drawn.
+/// Window pattern per region kind, so slabs read without color: whether
+/// the `i`-th window round the core (of 4 × 16) is drawn at `level`.
 pub fn stratum_keep(kind: RegionKind, i: usize, level: usize) -> bool {
     match kind {
         RegionKind::Code | RegionKind::Heap => true,
-        RegionKind::Anonymous => !i.is_multiple_of(3),
-        RegionKind::Library => (i + level).is_multiple_of(2),
-        RegionKind::File => i.is_multiple_of(3),
-        RegionKind::Stack => i.is_multiple_of(4) && level.is_multiple_of(2),
+        RegionKind::Anonymous => !(i + level).is_multiple_of(3),
+        // Vertical ribs.
+        RegionKind::Library => i.is_multiple_of(2),
+        RegionKind::File => i.is_multiple_of(3) && level.is_multiple_of(2),
+        // Horizontal bands.
+        RegionKind::Stack => level.is_multiple_of(2),
         RegionKind::Kernel => i.is_multiple_of(8),
     }
 }

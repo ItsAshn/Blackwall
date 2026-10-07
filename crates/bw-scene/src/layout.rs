@@ -115,33 +115,81 @@ pub fn levels(p: &Process) -> u32 {
     (4.0 + 10.0 * (1.0 + mb).log10()).round().clamp(4.0, 48.0) as u32
 }
 
-/// Side of the column's dot footprint: big processes are denser columns.
-pub fn footprint(p: &Process) -> u32 {
-    match p.mem_bytes {
-        m if m >= 2 << 30 => 3,
-        m if m >= 300 << 20 => 2,
-        _ => 1,
-    }
+/// Horizontal distance between a tower's windows.
+pub const WINDOW: f32 = 0.2;
+
+/// Resident memory at each ledge: a tower steps in at 10 MB, 100 MB, 1 GB
+/// and 10 GB, so the ledges are a scale you can count from afar.
+pub const LEDGE_MB: [f32; 4] = [10.0, 100.0, 1000.0, 10_000.0];
+
+fn level_of(mb: f32) -> f32 {
+    4.0 + 10.0 * (1.0 + mb).log10()
 }
 
-/// One process column.
+/// Levels at which a tower of `levels` has its ledges (bottom first).
+pub fn ledges(levels: u32) -> impl Iterator<Item = u32> {
+    LEDGE_MB
+        .iter()
+        .map(|mb| level_of(*mb).round() as u32)
+        .filter(move |l| *l < levels)
+}
+
+/// Windows along x and z: wider with more threads, deeper with more memory.
+/// The widest tower is four windows, so neighbours never touch but crowd.
+pub fn footprint(p: &Process) -> (u32, u32) {
+    if p.realm == Realm::Kernel {
+        return (1, 1);
+    }
+    let wx = match p.threads.unwrap_or(1) {
+        0..=2 => 2,
+        3..=12 => 3,
+        _ => 4,
+    };
+    let wz = match p.mem_bytes {
+        m if m >= 512 << 20 => 4,
+        m if m >= 64 << 20 => 3,
+        _ => 2,
+    };
+    (wx, wz)
+}
+
+/// One process tower.
 #[derive(Clone, Debug)]
 pub struct Column {
     pub key: ProcKey,
-    /// Center of the column's base, on the floor.
+    /// Center of the tower's base, on the floor.
     pub base: Vec3,
-    pub footprint: u32,
+    /// Windows along x and z at the base.
+    pub wx: u32,
+    pub wz: u32,
     pub levels: u32,
     pub realm: Realm,
 }
 
 impl Column {
+    pub fn for_process(p: &Process, base: Vec3) -> Column {
+        let (wx, wz) = footprint(p);
+        Column {
+            key: p.key,
+            base,
+            wx,
+            wz,
+            levels: levels(p),
+            realm: p.realm,
+        }
+    }
+
     pub fn height(&self) -> f32 {
         self.levels as f32 * LEVEL_H
     }
 
     pub fn top(&self) -> Vec3 {
         self.base + Vec3::Y * self.height()
+    }
+
+    /// Half of the base's width (x) and depth (z).
+    pub fn half(&self) -> Vec2 {
+        Vec2::new(self.wx as f32, self.wz as f32) * WINDOW * 0.5
     }
 }
 
@@ -216,12 +264,12 @@ impl Layout {
             districts.insert(0, suburb);
         }
 
-        // Each district is a grid with ~25% spare capacity, so a few
+        // Each district is a grid with ~10% spare capacity, so a few
         // processes coming and going don't reshape the whole city.
         let dims: Vec<(i32, i32)> = districts
             .iter()
             .map(|d| {
-                let cap = (d.len() as f32 * 1.25).ceil() as i32 + 1;
+                let cap = (d.len() as f32 * 1.1).ceil() as i32 + 1;
                 let w = (cap as f32).sqrt().ceil() as i32;
                 (w, (cap + w - 1) / w)
             })
@@ -257,14 +305,7 @@ impl Layout {
                 let gx = (ox + col) as f32 * CELL - city_w / 2.0;
                 // Row 0 is nearest the Wall; the city extends toward the viewer.
                 let gz = (oz + row) as f32 * CELL - city_d / 2.0;
-                let p = &s.processes[k];
-                columns.push(Column {
-                    key: *k,
-                    base: Vec3::new(gx, 0.0, gz),
-                    footprint: footprint(p),
-                    levels: levels(p),
-                    realm: Realm::User,
-                });
+                columns.push(Column::for_process(&s.processes[k], Vec3::new(gx, 0.0, gz)));
             }
         }
         let min = Vec2::new(-city_w / 2.0, -city_d / 2.0);
@@ -299,14 +340,10 @@ impl Layout {
             );
             for (i, k) in keys.iter().enumerate() {
                 let (row, col) = (i as i32 / w, i as i32 % w);
-                let p = &s.processes[k];
-                columns.push(Column {
-                    key: *k,
-                    base: Vec3::new(kx + col as f32 * CELL, 0.0, z0 - row as f32 * CELL),
-                    footprint: 1,
-                    levels: levels(p),
-                    realm: Realm::Kernel,
-                });
+                columns.push(Column::for_process(
+                    &s.processes[k],
+                    Vec3::new(kx + col as f32 * CELL, 0.0, z0 - row as f32 * CELL),
+                ));
                 kernel_sub.insert(*k, *sub);
             }
             kx += (w + 3) as f32 * CELL;
@@ -420,6 +457,23 @@ mod tests {
             "{moved} of {} columns moved",
             a.columns.len()
         );
+    }
+
+    #[test]
+    fn quantities_read_from_the_shape() {
+        let s = DemoWorld::new(1).sample();
+        let l = Layout::build(&s);
+        for c in &l.columns {
+            // Towers crowd but never touch.
+            assert!(c.half().max_element() * 2.0 < CELL);
+        }
+        // Ledges mark 10 MB, 100 MB, 1 GB: a 2 GB tower has three.
+        let mut p = s.processes.values().next().unwrap().clone();
+        p.realm = Realm::User;
+        p.mem_bytes = 2 << 30;
+        assert_eq!(ledges(levels(&p)).count(), 3);
+        p.mem_bytes = 5 << 20;
+        assert_eq!(ledges(levels(&p)).count(), 0);
     }
 
     #[test]
